@@ -26,6 +26,10 @@ posts.*.bak.json
 *.psd
 *.sketch
 
+# 内部调研：这份报告列了本机服务的已知安全缺口（监听 0.0.0.0、无鉴权），
+# 仓库是公开的，所以默认不发布。想公开的话删掉这一行再提交即可。
+/docs/capability-upgrade-review.md
+
 # 运行时
 __pycache__/
 *.py[cod]

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "quarry",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["server/server.py"],
+      "port": 6002
+    }
+  ]
+}
