@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Quarry 产品层 —— 仓库里只允许有代码，任何采集到的内容都不进 git。
+# 内容层默认在仓库同级的 ../vault/，用 QUARRY_VAULT 可以指到别处。
+# ---------------------------------------------------------------------------
+
+# 内容层（万一有人把 vault 放进了仓库目录，这里兜底）
+/vault/
+/data/
+/media/
+/outputs/
+/archive/
+posts.json
+posts.*.bak.json
+
+# 采集产物：媒体与转写四件套
+*.mp4
+*.mov
+*.m4a
+*.mp3
+*.wav
+*.srt
+*.vtt
+*口播词.md
+
+# 图标源文件之外的大图不要误入
+*.psd
+*.sketch
+
+# 运行时
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.log
+.pytest_cache/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
