@@ -39,7 +39,7 @@ Quarry-选题矿场/
 
 后端跑的是**双根静态解析**：前端资源从 `app/` 出，媒体从 `vault/` 出，两个根各自做路径越界校验。这样产品可以随便 clone、随便重装，内容层原地不动。
 
-内容层默认在仓库同级的 `../vault/`，也可以指到任意位置（外置硬盘、同步盘）：
+内容层默认在**主仓库**同级的 `../vault/`（在 git worktree 里启动也会自动指回同一个内容层，不会在 worktree 旁边另开一个），也可以指到任意位置（外置硬盘、同步盘）：
 
 ```bash
 QUARRY_VAULT=/Volumes/Data/quarry-vault ./start.sh
