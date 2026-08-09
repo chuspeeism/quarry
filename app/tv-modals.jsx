@@ -296,27 +296,14 @@ function EditModal({ post, onClose, onSaved }) {
 }
 
 /* ===================== collect (paste link, 支持多行批量) ===================== */
-const FETCH_STEPS = ["解析链接与平台", "抓取媒体与封面", "AI 生成摘要与关键词", "写入本地课题库"];
-
-// 批量列表里的链接截短显示（去协议，保头尾）
-function shortLink(u) {
-  const s = String(u || "").replace(/^https?:\/\//, "");
-  return s.length > 44 ? s.slice(0, 28) + "…" + s.slice(-13) : s;
-}
-
-function CollectModal({ topics, defaultTopic, onClose, onCollected }) {
+// 点「收藏」后立即把链接交给 App 层的收藏队列（onQueue）并关闭弹窗：
+// 抓取/AI 的实时进度显示在列表顶部的预览卡片里，用户可以继续浏览和操作。
+function CollectModal({ topics, defaultTopic, onClose, onQueue }) {
   const [url, setUrl] = useState("");
   const [topic, setTopic] = useState(defaultTopic);
-  const [phase, setPhase] = useState("input"); // input | fetching | success | error | batch
-  const [step, setStep] = useState(0);
-  const [statusMsg, setStatusMsg] = useState("");
-  const [errorMsg, setErrorMsg] = useState("");
-  const [doneTopic, setDoneTopic] = useState(defaultTopic);
-  const [rows, setRows] = useState([]); // 批量模式：{url, status, progress, message}
   const inputRef = useRef(null);
-  const mounted = useRef(true);
 
-  // 粘贴内容按换行/空白切分成多条链接；1 条时完全走原单条流程
+  // 粘贴内容按换行/空白切分成多条链接
   const links = url.split(/\s+/).map((s) => s.trim()).filter(Boolean);
   const multi = links.length > 1;
   const detected = detectPlatform(links[0] || "");
@@ -324,105 +311,23 @@ function CollectModal({ topics, defaultTopic, onClose, onCollected }) {
   links.forEach((u) => { const id = detectPlatform(u); if (id) detectedSet[id] = true; });
 
   useEffect(() => { inputRef.current && inputRef.current.focus(); }, []);
-  useEffect(() => () => { mounted.current = false; }, []);
-
-  // —— 单条（与旧版一致）：POST /api/add 拿 taskId，再轮询 /api/task/<id>，
-  // 用后端 progress(0-100) 驱动 4 步进度条。
-  async function startSingle(link) {
-    setErrorMsg(""); setStep(0); setStatusMsg("正在创建任务…"); setPhase("fetching");
-    try {
-      const taskId = await window.TVApi.addLink(link, topic);
-      const result = await window.TVApi.pollTask(taskId, (tk) => {
-        if (!mounted.current) return;
-        setStep(Math.max(0, Math.min(FETCH_STEPS.length, Math.floor((tk.progress || 0) / 25))));
-        if (tk.message) setStatusMsg(tk.message);
-      });
-      if (!mounted.current) return;
-      const tp = result.topic || topic;
-      setDoneTopic(tp);
-      setStep(FETCH_STEPS.length);
-      setStatusMsg(result.message || "已加入收藏");
-      setPhase("success");
-      setTimeout(() => { if (mounted.current) onCollected(tp); }, 950);
-    } catch (err) {
-      if (!mounted.current) return;
-      setErrorMsg((err && err.message) || "收藏失败");
-      setPhase("error");
-    }
-  }
-
-  // —— 批量：优先 addLinks 一次建全部任务，失败/缺失时逐条 addLink 回退；
-  // 各行并行 pollTask，互不阻塞，个别失败只标红该行。
-  async function startBatch(list) {
-    setErrorMsg("");
-    setRows(list.map((u) => ({ url: u, status: "pending", progress: 0, message: "排队中…" })));
-    setPhase("batch");
-
-    const put = (i, patch) => {
-      if (!mounted.current) return;
-      setRows((rs) => rs.map((r, j) => (j === i ? Object.assign({}, r, patch) : r)));
-    };
-
-    let tasks = null;
-    if (typeof window.TVApi.addLinks === "function") {
-      try { tasks = await window.TVApi.addLinks(list, topic); }
-      catch (err) { tasks = null; /* 后端不支持批量时逐条回退 */ }
-    }
-    const byUrl = {};
-    (tasks || []).forEach((t) => { if (t && t.url && t.taskId) byUrl[t.url] = t.taskId; });
-
-    await Promise.all(list.map(async (u, i) => {
-      try {
-        let tid = byUrl[u] || (tasks && tasks[i] && tasks[i].taskId) || null;
-        if (!tid) {
-          put(i, { status: "running", message: "创建任务…" });
-          tid = await window.TVApi.addLink(u, topic);
-        }
-        put(i, { status: "running", message: "处理中…" });
-        await window.TVApi.pollTask(tid, (tk) => {
-          put(i, { progress: tk.progress || 0, message: tk.message || "" });
-        });
-        put(i, { status: "done", progress: 100, message: "已收藏" });
-      } catch (err) {
-        put(i, { status: "error", message: (err && err.message) || "收藏失败" });
-      }
-    }));
-  }
 
   function start() {
     if (!links.length) return;
-    if (links.length === 1) startSingle(links[0]);
-    else startBatch(links);
+    onQueue(links, topic);
   }
 
-  const okCount = rows.filter((r) => r.status === "done").length;
-  const failCount = rows.filter((r) => r.status === "error").length;
-  const allSettled = rows.length > 0 && okCount + failCount === rows.length;
-
-  if (phase === "success") {
-    const p = PLATFORMS[detected || "x"];
-    return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget) onClose(); } },
-      m("div", { className: "tv-modal" },
-        m("div", { className: "tv-success" },
-          m("div", { className: "burst" }, m(Icon, { name: "check", size: 28 })),
-          m("h3", null, "已收藏到课题"),
-          m("p", null, `${p.label} · 已写入「${(topics.find((t) => t.id === doneTopic) || {}).name || ""}」`)
-        )
-      )
-    );
-  }
-
-  return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget && phase === "input") onClose(); } },
+  return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget) onClose(); } },
     m("div", { className: "tv-modal" },
       m("button", { className: "tv-detail-x", onClick: onClose, style: { top: 16, right: 16 } }, m(Icon, { name: "close", size: 16 })),
       m("div", { className: "tv-modal-head" },
         m("div", { className: "mi" }, m(Icon, { name: "link", size: 19 })),
         m("div", null,
           m("h3", null, "收藏链接"),
-          m("p", null, "粘贴 X / B站 / 小红书 / 抖音 链接，支持多行批量，自动识别平台并沉淀到本地。")
+          m("p", null, "粘贴 X / B站 / 小红书 / 抖音 链接，支持多行批量。收藏后立即开卡，进度在列表顶部实时显示。")
         )
       ),
-      phase === "input" ? m(React.Fragment, null,
+      m(React.Fragment, null,
         m("div", { className: "tv-modal-body" },
           m("div", { className: "tv-paste" + (multi || url.indexOf("\n") >= 0 ? " is-multi" : "") },
             m("span", { className: "pf-detect", style: !multi && detected ? { background: PLATFORMS[detected].color, color: "#0b0c0f" } : {} },
@@ -462,86 +367,8 @@ function CollectModal({ topics, defaultTopic, onClose, onCollected }) {
           m("div", { className: "spacer" }),
           m("button", { className: "tv-btn ghost", onClick: onClose }, "取消"),
           m("button", { className: "tv-btn primary", disabled: !links.length, onClick: start },
-            m(Icon, { name: "download", size: 15 }), multi ? "批量收藏 " + links.length + " 条" : "收藏")
+            m(Icon, { name: "download", size: 15 }), multi ? "立即收藏 " + links.length + " 条" : "立即收藏")
         )
-      ) : phase === "batch" ? m(React.Fragment, null,
-        m("div", { className: "tv-modal-body" },
-          m("div", { className: "tv-batch-head" },
-            m("span", { className: "n" }, "已完成 " + okCount + "/" + rows.length),
-            failCount ? m("span", { className: "f" }, failCount + " 条失败") : null,
-            m("span", { className: "spacer" }),
-            allSettled ? null : m("span", { className: "run" }, "并行抓取中…")
-          ),
-          m("div", { className: "tv-batch-list tv-scroll" },
-            rows.map((r, i) => {
-              const pid = detectPlatform(r.url);
-              const pct = r.status === "done" ? 100 : Math.max(0, Math.min(100, Math.round(r.progress || 0)));
-              return m("div", { key: i, className: "tv-batch-row " + r.status },
-                m("span", { className: "st" },
-                  r.status === "done" ? m(Icon, { name: "check", size: 12 })
-                    : r.status === "error" ? m(Icon, { name: "close", size: 12 })
-                    : m(Icon, { name: "refresh", size: 12,
-                        style: r.status === "running" ? { animation: "spin 1s linear infinite" } : null })),
-                m("div", { className: "main" },
-                  m("div", { className: "url" },
-                    pid ? m(PfChip, { id: pid, size: 14 }) : null,
-                    m("span", { className: "u", title: r.url }, shortLink(r.url))),
-                  r.status === "error"
-                    ? m("div", { className: "err" }, r.message)
-                    : m("div", { className: "tv-batch-bar" },
-                        m("span", { className: "fill", style: { width: (r.status === "pending" ? 3 : Math.max(4, pct)) + "%" } }))
-                ),
-                m("span", { className: "pct" },
-                  r.status === "done" ? "完成" : r.status === "error" ? "失败" : pct + "%")
-              );
-            })
-          )
-        ),
-        m("div", { className: "tv-modal-foot" },
-          m("div", { className: "spacer" }),
-          allSettled
-            ? m("button", { className: "tv-btn primary", onClick: () => (okCount > 0 ? onCollected(topic) : onClose()) },
-                m(Icon, { name: "check", size: 15 }), "完成")
-            : m("button", { className: "tv-btn ghost", disabled: true },
-                m(Icon, { name: "refresh", size: 15 }), "批量收藏中…")
-        )
-      ) : phase === "error" ? m(React.Fragment, null,
-        m("div", { className: "tv-modal-body" },
-          m("div", { className: "tv-collect-error" },
-            m("div", { className: "ico" }, m(Icon, { name: "close", size: 22 })),
-            m("div", null,
-              m("div", { className: "t" }, "收藏失败"),
-              m("div", { className: "s" }, errorMsg || "请检查链接或本地后端服务后重试。")
-            )
-          )
-        ),
-        m("div", { className: "tv-modal-foot" },
-          m("div", { className: "spacer" }),
-          m("button", { className: "tv-btn ghost", onClick: onClose }, "关闭"),
-          m("button", { className: "tv-btn primary", onClick: () => { setPhase("input"); setStatusMsg(""); } }, "重试")
-        )
-      ) : /* fetching */ m("div", { className: "tv-fetching", style: { paddingBottom: 22 } },
-        m("div", { className: "tv-fetch-card" },
-          m("div", { className: "tv-fetch-thumb", style: { "--pc": detected ? PLATFORMS[detected].color : "var(--x)" } }),
-          m("div", { className: "tv-fetch-lines" },
-            m("div", { className: "ln tv-shimmer", style: { width: "70%" } }),
-            m("div", { className: "ln tv-shimmer", style: { width: "92%" } }),
-            m("div", { className: "ln tv-shimmer", style: { width: "48%" } })
-          )
-        ),
-        m("div", { className: "tv-fetch-steps" },
-          FETCH_STEPS.map((label, i) => {
-            const state = i < step ? "done" : i === step ? "active" : "";
-            return m("div", { key: i, className: "tv-fstep " + state },
-              m("span", { className: "tick" },
-                i < step ? m(Icon, { name: "check", size: 11 })
-                  : i === step ? m(Icon, { name: "refresh", size: 11, style: {}, }) : null
-              ),
-              label
-            );
-          })
-        ),
-        statusMsg ? m("div", { className: "tv-fetch-status" }, statusMsg) : null
       )
     )
   );

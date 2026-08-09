@@ -1,4 +1,4 @@
-/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, Sidebar, Card, Row, Detail, CollectModal, NewTopicModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
+/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, detectPlatform, Sidebar, Card, Row, PendingCard, PendingRow, Detail, CollectModal, NewTopicModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
 const { createElement: e, useState, useEffect, useMemo, useRef, useCallback } = React;
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
@@ -117,19 +117,79 @@ function App() {
 
   const showToast = (text) => { setToast(text); setTimeout(() => setToast(null), 2600); };
 
-  // CollectModal 已经完成真实的后端抓取 + AI，这里只负责刷新列表并定位到该课题。
-  const onCollected = async (topicId) => {
-    setModal(null);
-    setPlatformFilter([]); setTypeFilter([]); setQuery("");
+  // ===== 收藏队列：粘贴链接后立即在列表顶部开预览卡片，抓取/AI 进度都在卡片里 =====
+  // pending: [{key, url, topic, platform, taskId, status: running|error, progress, message}]
+  const [pending, setPending] = useState([]);
+  const pendingSeq = useRef(0);
+
+  const patchPending = (key, patch) =>
+    setPending((ps) => ps.map((it) => (it.key === key ? { ...it, ...patch } : it)));
+  const removePending = (key) => setPending((ps) => ps.filter((it) => it.key !== key));
+
+  // 单张卡片的完整生命周期：建任务 -> 轮询进度 -> 刷新列表让真实帖子替换卡片。
+  const runPendingTask = async (key, url, topicId, taskId) => {
+    let result;
     try {
-      const data = await refresh(topicId);
-      setActiveTopic(topicId);
-      const tn = (data.topics.find((tp) => tp.id === topicId) || {}).name || topicId;
-      showToast("已收藏到「" + tn + "」");
+      if (!taskId) taskId = await window.TVApi.addLink(url, topicId);
+      patchPending(key, { taskId, message: "开始抓取…" });
+      result = await window.TVApi.pollTask(taskId, (tk) => {
+        patchPending(key, { progress: tk.progress || 0, message: tk.message || "" });
+      });
     } catch (err) {
+      patchPending(key, { status: "error", message: (err && err.message) || "收藏失败" });
+      return;
+    }
+    patchPending(key, { progress: 100, message: "已收藏" });
+    try {
+      const data = await refresh();
+      removePending(key);
+      const post = result.postId
+        ? data.posts.find((p) => p.id === result.postId && p.topic === (result.topic || topicId))
+        : null;
+      const nm = ((post && post.title) || "").trim();
+      showToast(nm ? "已收藏「" + (nm.length > 18 ? nm.slice(0, 18) + "…" : nm) + "」" : "已收藏 1 条链接");
+    } catch (err) {
+      removePending(key);
       showToast("已收藏，但刷新失败，请手动刷新页面");
     }
   };
+
+  // 入口：一批链接 -> 立即插卡（多条并行），后台批量建任务后各自轮询。
+  const collectLinks = (urls, topicId) => {
+    const entries = urls.map((u) => ({
+      key: "pd" + (++pendingSeq.current), url: u, topic: topicId,
+      platform: detectPlatform(u), taskId: null,
+      status: "running", progress: 0, message: "创建任务…",
+    }));
+    setPending((ps) => [...entries, ...ps]);
+    setActiveTopic(topicId);
+    showToast(entries.length > 1
+      ? "已开始并行收藏 " + entries.length + " 条，进度见顶部卡片"
+      : "已开始收藏，进度见顶部卡片");
+    (async () => {
+      let tasks = null;
+      if (entries.length > 1 && typeof window.TVApi.addLinks === "function") {
+        try { tasks = await window.TVApi.addLinks(urls, topicId); }
+        catch (err) { tasks = null; /* 后端不支持批量时逐条回退 */ }
+      }
+      const byUrl = {};
+      (tasks || []).forEach((t) => { if (t && t.url && t.taskId) byUrl[t.url] = t.taskId; });
+      entries.forEach((en, i) => {
+        const tid = byUrl[en.url] || (tasks && tasks[i] && tasks[i].taskId) || null;
+        runPendingTask(en.key, en.url, topicId, tid);
+      });
+    })();
+  };
+
+  const retryPending = (key) => {
+    const it = pending.find((x) => x.key === key);
+    if (!it) return;
+    patchPending(key, { status: "running", progress: 0, message: "重新排队…", taskId: null });
+    runPendingTask(key, it.url, it.topic, null);
+  };
+
+  // 当前课题下进行中的预览卡（置顶显示，不受筛选/排序影响）
+  const pendingHere = pending.filter((it) => it.topic === activeTopic);
   // Detail 里删除成功后：关详情 -> 刷新 -> toast
   const onDeleted = async (post) => {
     closeDetail();
@@ -162,6 +222,23 @@ function App() {
       showToast("课题已创建，但刷新失败，请手动刷新页面");
     }
   };
+
+  // 全局粘贴：不在输入框里、没开弹窗时，Cmd+V 粘贴链接直接开卡收藏到当前课题。
+  useEffect(() => {
+    const onPaste = (ev) => {
+      const el = ev.target;
+      const tag = el && el.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (el && el.isContentEditable)) return;
+      if (modal) return; // CollectModal 自己有输入框
+      const text = (ev.clipboardData && ev.clipboardData.getData("text")) || "";
+      const urls = text.split(/\s+/).map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
+      if (!urls.length || !activeTopic) return;
+      ev.preventDefault();
+      collectLinks(urls, activeTopic);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [modal, activeTopic]);
 
   // keyboard
   useEffect(() => {
@@ -255,14 +332,16 @@ function App() {
           e("button", { className: "tv-fclose", onClick: () => setQuery("") }, e(Icon, { name: "close", size: 11 }))) : null,
         e("button", { className: "tv-clear", onClick: clearFilters }, "清除全部")
       ) : null,
-      // board
+      // board（收藏中的预览卡片固定置顶，不受筛选/排序影响）
       e("div", { className: "tv-board tv-scroll" },
-        visible.length === 0
+        visible.length === 0 && pendingHere.length === 0
           ? e(EmptyState, { topic: activeTopicObj, hasFilters, onCollect: () => setModal("collect"), onClear: clearFilters })
           : view === "grid"
             ? e("div", { className: "tv-grid" + (dense ? " dense" : "") },
+                pendingHere.map((it) => e(PendingCard, { key: it.key, item: it, dense, onRetry: retryPending, onRemove: removePending })),
                 visible.map((p, i) => e(Card, { key: p.id, post: p, dense, onOpen: () => openAt(i) })))
             : e("div", { className: "tv-list" },
+                pendingHere.map((it) => e(PendingRow, { key: it.key, item: it, onRetry: retryPending, onRemove: removePending })),
                 visible.map((p, i) => e(Row, { key: p.id, post: p, onOpen: () => openAt(i) })))
       )
     ),
@@ -271,7 +350,10 @@ function App() {
       ? e(Detail, { post: visible[openIndex], index: openIndex, total: visible.length, lang, setLang, onPrev: prev, onNext: next, onClose: closeDetail, onDeleted, onEdited })
       : null,
     // modals
-    modal === "collect" ? e(CollectModal, { topics: topicsWithCount, defaultTopic: activeTopic, onClose: () => setModal(null), onCollected }) : null,
+    modal === "collect" ? e(CollectModal, {
+      topics: topicsWithCount, defaultTopic: activeTopic, onClose: () => setModal(null),
+      onQueue: (links, topicId) => { setModal(null); collectLinks(links, topicId); },
+    }) : null,
     modal === "newtopic" ? e(NewTopicModal, { onClose: () => setModal(null), onCreate: onCreateTopic }) : null,
     // toast
     toast ? e("div", { className: "tv-toast-wrap" }, e("div", { className: "tv-toast" },
