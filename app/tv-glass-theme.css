@@ -559,3 +559,16 @@ button { color: inherit; background: none; border: 0; cursor: pointer; }
 .tv-prow .tv-row-thumb .mini { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-2); z-index: 1; }
 .tv-prow .tv-batch-bar { margin-top: 6px; max-width: 340px; }
 .tv-prow .tv-row-side .when { font-variant-numeric: tabular-nums; }
+
+/* ---- engagement stats（收藏时点互动数据快照） ---- */
+.tv-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.tv-stat { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tv-stat svg { flex: none; opacity: .75; }
+.tv-stats.card { gap: 9px; margin-top: -2px; }
+.tv-stats.row { display: inline-flex; flex-wrap: nowrap; gap: 8px; overflow: hidden; }
+.tv-stats.row .tv-stat { font-size: 10px; }
+.tv-detail-stats { display: flex; align-items: center; gap: 13px; flex-wrap: wrap; margin: -6px 0 14px; padding: 9px 12px; border-radius: 10px; background: rgba(255,255,255,0.55); border: 1px solid var(--line); }
+.tv-detail-stats .tv-stat { gap: 5px; font-size: 12px; color: var(--ink-2); }
+.tv-detail-stats .tv-stat b { font-weight: 650; font-variant-numeric: tabular-nums; }
+.tv-detail-stats .tv-stat .lb { font-family: var(--font-ui, inherit); font-size: 10.5px; color: var(--faint); }
+.tv-detail-stats .tv-stat-cap { margin-left: auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--faint); white-space: nowrap; }

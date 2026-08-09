@@ -1,4 +1,4 @@
-/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform */
+/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform, StatIcon, statEntries, fmtCount */
 const { createElement: m, useState, useEffect, useRef } = React;
 
 /* ===================== detail media (placeholder, type-aware) ===================== */
@@ -83,6 +83,25 @@ function ExtraIcon({ name, size = 15, style }) {
   }, m("path", { d: EXTRA_ICON_PATHS[name] || "" }));
 }
 
+// 收藏时点的互动数据条：浏览/点赞/收藏/评论/分享 + 抓取时间标注
+function DetailStats({ stats }) {
+  const list = statEntries(stats);
+  if (!list.length) return null;
+  let cap = "";
+  if (stats.capturedAt) {
+    const d = new Date(stats.capturedAt * 1000);
+    const pad = (n) => String(n).padStart(2, "0");
+    cap = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  return m("div", { className: "tv-detail-stats" },
+    list.map((s) => m("span", { key: s.key, className: "tv-stat", title: s.label + " " + s.value.toLocaleString() },
+      m(StatIcon, { name: s.key, size: 14 }),
+      m("b", null, fmtCount(s.value)),
+      m("span", { className: "lb" }, s.label))),
+    cap ? m("span", { className: "tv-stat-cap", title: "互动数据为收藏（下载）时抓取的快照，非实时" }, "收藏时数据 · " + cap) : null
+  );
+}
+
 // 口播转写：行格式 "[MM:SS → MM:SS] 文本"，等宽字体逐行展示，时间戳弱化
 function TranscriptView({ text }) {
   const lines = String(text || "").split(/\r?\n/).filter((ln) => ln.trim() !== "");
@@ -161,6 +180,7 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
               : null
           ),
           m("h2", { className: "tv-detail-title" }, post.title),
+          m(DetailStats, { stats: post.stats }),
           mode === "transcript"
             ? m(TranscriptView, { text: post.transcript })
             : m("p", { className: "tv-detail-copy" }, copy),

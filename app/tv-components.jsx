@@ -6,6 +6,50 @@ function excerpt(post, n) {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
+/* ---------------- 互动数据（收藏时点快照）---------------- */
+// 图标沿用 tv-icons.jsx 的 24-grid stroke 风格，在本文件内补充，避免动图标库。
+const STAT_ICON_PATHS = {
+  views: "M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12ZM12 14.6a2.6 2.6 0 1 0 0-5.2 2.6 2.6 0 0 0 0 5.2Z",
+  likes: "M12 20.2S3.6 15.2 3.6 9.7c0-2.5 1.9-4.5 4.3-4.5 1.7 0 3.2 1 4.1 2.5.9-1.5 2.4-2.5 4.1-2.5 2.4 0 4.3 2 4.3 4.5 0 5.5-8.4 10.5-8.4 10.5Z",
+  collects: "M7 3.5h10v17l-5-3.4-5 3.4Z",
+  comments: "M4 5.5h16v11h-9.5L5 20v-3.5H4Z",
+  shares: "M13.5 5.5 21 12l-7.5 6.5v-4C9 14.5 5.5 16.5 3 20c.5-6.5 4.5-10.5 10.5-11Z",
+};
+const STAT_ORDER = ["views", "likes", "collects", "comments", "shares"];
+const STAT_LABELS = { views: "浏览", likes: "点赞", collects: "收藏", comments: "评论", shares: "分享" };
+
+function StatIcon({ name, size = 13 }) {
+  return hh("svg", {
+    width: size, height: size, viewBox: "0 0 24 24",
+    fill: "none", stroke: "currentColor",
+    strokeWidth: 1.6, strokeLinecap: "round", strokeLinejoin: "round",
+  }, hh("path", { d: STAT_ICON_PATHS[name] || "" }));
+}
+
+function fmtCount(n) {
+  if (typeof n !== "number" || !isFinite(n)) return "";
+  if (n >= 100000000) return (n / 100000000).toFixed(1).replace(/\.0$/, "") + "亿";
+  if (n >= 10000) return (n / 10000).toFixed(1).replace(/\.0$/, "") + "万";
+  return String(n);
+}
+
+// stats -> [{key,label,value}]，只保留真实抓到的项，顺序固定：浏览/点赞/收藏/评论/分享
+function statEntries(stats) {
+  if (!stats || typeof stats !== "object") return [];
+  return STAT_ORDER
+    .filter((k) => typeof stats[k] === "number" && isFinite(stats[k]))
+    .map((k) => ({ key: k, label: STAT_LABELS[k], value: stats[k] }));
+}
+
+// 一排统计小徽章；max 限制条数（卡片空间小），title 悬浮显示完整含义
+function StatChips({ stats, max, className }) {
+  const list = statEntries(stats).slice(0, max || STAT_ORDER.length);
+  if (!list.length) return null;
+  return hh("div", { className: "tv-stats" + (className ? " " + className : "") },
+    list.map((s) => hh("span", { key: s.key, className: "tv-stat", title: s.label + " " + s.value.toLocaleString() },
+      hh(StatIcon, { name: s.key }), fmtCount(s.value))));
+}
+
 /* one-click open-original link (stops card click) */
 function SourceLink({ post, variant }) {
   if (!post.sourceLink) return null;
@@ -79,6 +123,7 @@ function Card({ post, dense, onOpen }) {
         )
       ),
       hh("h3", { className: "tv-card-title" }, post.title),
+      hh(StatChips, { stats: post.stats, max: 4, className: "card" }),
       hh("div", { className: "tv-card-foot" },
         post.keywords.length
           ? hh("span", { className: "tv-kw" }, hh(Icon, { name: "tag", size: 12 }), `${post.keywords.length} 关键词`)
@@ -100,7 +145,9 @@ function Row({ post, onOpen }) {
       hh("div", { className: "s" },
         hh("span", null, post.author),
         hh("span", { className: "dot" }),
-        hh("span", null, post.keywords.length ? `${post.keywords.length} 关键词` : "笔记")
+        hh("span", null, post.keywords.length ? `${post.keywords.length} 关键词` : "笔记"),
+        statEntries(post.stats).length ? hh("span", { className: "dot" }) : null,
+        hh(StatChips, { stats: post.stats, max: 3, className: "row" })
       )
     ),
     hh("div", { className: "tv-row-side" },
@@ -271,4 +318,4 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
   );
 }
 
-Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow });
+Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount });

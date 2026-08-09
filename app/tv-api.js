@@ -82,6 +82,8 @@
       imageCount: p.imagePath ? 1 : 0,
       mediaUrl: abs(p.mediaPath),
       imageUrl: imageUrl,
+      // 收藏时点的互动数据快照 {views,likes,collects,comments,shares,capturedAt}；旧数据没有则为空对象
+      stats: (p.stats && typeof p.stats === "object" && !Array.isArray(p.stats)) ? p.stats : {},
       // 口播转写相关新字段：旧数据（含离线快照）没有这些键，统一按空串透传
       transcript: p.transcript || "",
       transcriptSrtPath: p.transcriptSrtPath || "",
