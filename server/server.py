@@ -63,9 +63,31 @@ REPO_ROOT = os.path.dirname(HERE)                       # <repo>
 APP_ROOT = os.path.join(REPO_ROOT, "app")               # 前端静态资源
 INDEX_HTML = os.path.join(APP_ROOT, "index.html")
 
-# 内容层：与产品层彻底分离，默认落在仓库同级的 ../vault，可用 QUARRY_VAULT 指到任意位置。
+
+def _main_repo_root() -> str:
+    """主仓库根目录。
+
+    git worktree 里 REPO_ROOT 指向 <repo>/.claude/worktrees/<name>/，按它取同级 ../vault
+    会算到 worktrees/vault —— 既不是真的内容层，还落在仓库目录里面。用 git 的 common-dir
+    反推主仓库位置：worktree 里返回主仓库的 <repo>/.git，普通仓库里返回相对的 .git，
+    两种都能 join 回 <repo>。非 git 仓库（下载 zip）或 git 不可用时退回 REPO_ROOT。
+    """
+    try:
+        proc = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--git-common-dir"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return REPO_ROOT
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return REPO_ROOT
+    root = os.path.dirname(os.path.abspath(os.path.join(REPO_ROOT, proc.stdout.strip())))
+    # 认领前先自证：主仓库里必须有这份代码本身，否则宁可用 REPO_ROOT。
+    return root if os.path.isfile(os.path.join(root, "server", "server.py")) else REPO_ROOT
+
+
+# 内容层：与产品层彻底分离，默认落在主仓库同级的 ../vault，可用 QUARRY_VAULT 指到任意位置。
 VAULT_ROOT = os.path.abspath(
-    os.environ.get("QUARRY_VAULT") or os.path.join(os.path.dirname(REPO_ROOT), "vault")
+    os.environ.get("QUARRY_VAULT")
+    or os.path.join(os.path.dirname(_main_repo_root()), "vault")
 )
 DATA_DIR = os.path.join(VAULT_ROOT, "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")

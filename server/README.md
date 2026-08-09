@@ -24,13 +24,15 @@ Quarry · 选题矿场 已启动
 | 根 | 变量 | 默认位置 | 内容 |
 |----|------|----------|------|
 | 产品层 | `APP_ROOT` | `<repo>/app` | 前端静态资源，进 git |
-| 内容层 | `VAULT_ROOT` | `<repo>/../vault` | 采集到的一切，**永不进 git** |
+| 内容层 | `VAULT_ROOT` | `<主仓库>/../vault` | 采集到的一切，**永不进 git** |
 
 `QUARRY_VAULT` 可以把内容层指到任意路径（外置硬盘、同步盘都行）：
 
 ```bash
 QUARRY_VAULT=/Volumes/Data/quarry-vault ./start.sh
 ```
+
+默认位置里的 `<repo>` 指**主仓库**，不是当前工作副本。在 `git worktree` 里启动时，后端会用 `git rev-parse --git-common-dir` 反推主仓库位置，所以任何 worktree 跑起来都指向同一个内容层，不会在 worktree 旁边另开一个 vault。非 git 仓库（下载 zip）或 git 不可用时退回当前目录的同级 `../vault`。
 
 静态文件解析是双根的：先在 `APP_ROOT` 找前端资源，找不到再回落到 `VAULT_ROOT` 找媒体。两个根各自做越界校验，`../` 逃逸会被拒绝。
 
@@ -66,7 +68,7 @@ vault/
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` | 6002 | 监听端口 |
-| `QUARRY_VAULT` | `<repo>/../vault` | 内容层根目录 |
+| `QUARRY_VAULT` | `<主仓库>/../vault` | 内容层根目录 |
 | `QUARRY_DEFAULT_TOPIC_ID` | `inbox` | 默认课题 id |
 | `QUARRY_DEFAULT_TOPIC_NAME` | 未归类 | 默认课题名 |
 | `QUARRY_IMPORT_CONCURRENCY` | 2 | 并发导入闸门 |
