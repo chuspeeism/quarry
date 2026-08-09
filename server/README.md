@@ -72,10 +72,41 @@ vault/
 | `QUARRY_DEFAULT_TOPIC_ID` | `inbox` | 默认课题 id |
 | `QUARRY_DEFAULT_TOPIC_NAME` | 未归类 | 默认课题名 |
 | `QUARRY_IMPORT_CONCURRENCY` | 2 | 并发导入闸门 |
+| `QUARRY_OPENCLI_PROFILE` | — | 采集专用的浏览器 profile 别名，见下节 |
+| `QUARRY_OPENCLI_WINDOW` | background | opencli 窗口模式，`background` / `foreground` |
+| `QUARRY_OPENCLI_SITE_SESSION` | persistent | 同平台复用同一标签页；置空则每条命令新开一个 |
 | `AI_ENGINE` | codex | `codex` / `ark` / `none` |
 | `ARK_API_KEY` | — | `AI_ENGINE=ark` 时必填 |
 | `ARK_MODEL` | doubao-seed-1-6-250615 | 豆包模型 |
 | `OPENCLI_BIN` / `CODEX_BIN` | opencli / codex | 可执行文件路径 |
+
+## 采集时不要抢你的屏幕
+
+opencli 没有 headless 模式，抓取一定要在一个真实浏览器里开页。默认情况下它用的就是你
+自己那个装了 Browser Bridge 扩展的浏览器，所以采集窗口会盖在你正在看的页面上面。
+
+后端这边已经做到的：
+
+- 所有 opencli 调用收敛到 `run_opencli_site()` 一个出口，统一带 `--window background`
+  并同时设 `OPENCLI_WINDOW` 环境变量，不存在哪条命令漏掉的可能
+- `--site-session persistent`：同一平台的多条命令复用同一个标签页，而不是一条命令开一个
+- 同平台的 opencli 命令串行执行，一个平台从头到尾只占一个标签页；不同平台之间照旧并行。
+  代价是一次粘一堆同平台链接时会排队，想换回并行就设 `QUARRY_OPENCLI_SITE_SESSION=`（置空）
+- B 站的标题/简介/封面/UP 主/互动数据改走公开接口，完全不开浏览器
+
+剩下那一次窗口，唯一的根治办法是**别让它开在你正在用的浏览器里**：
+
+1. 在另一个浏览器（或另一个 Chrome profile）里装上 Browser Bridge 扩展，
+   在里面登好 B 站 / 小红书 / 抖音 / X
+2. `opencli profile list` 找到它的 contextId，`opencli profile rename <contextId> quarry`
+3. 启动时把采集指过去：
+
+```bash
+QUARRY_OPENCLI_PROFILE=quarry ./start.sh
+```
+
+4. macOS 上再把这个浏览器拖到另一个桌面（Space）：右键 Dock 图标 →「选项」→
+   「此桌面」。之后采集窗口只会在那个桌面里开合，不再盖住你手上的活。
 
 ## 接口
 

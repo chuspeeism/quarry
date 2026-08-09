@@ -37,6 +37,7 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -107,6 +108,14 @@ SEED_FILE = os.path.join(
 PORT = int(os.environ.get("PORT", "6002"))
 OPENCLI = os.environ.get("OPENCLI_BIN", "opencli")
 CODEX = os.environ.get("CODEX_BIN", "codex")
+# opencli 只能驱动真实浏览器（没有 headless 模式），所以采集必然会在某个浏览器里开页。
+# 下面三个开关决定"开在哪、开几个、开完留不留"，默认值按"尽量不打扰用户"来选：
+#   window       背景窗口，不抢应用焦点
+#   profile      指定一个你平时不工作的浏览器 profile 专门跑采集（强烈建议配）
+#   site-session 同一平台复用同一个标签页，而不是每条命令新开一个
+OPENCLI_WINDOW = os.environ.get("QUARRY_OPENCLI_WINDOW", "background")
+OPENCLI_PROFILE = os.environ.get("QUARRY_OPENCLI_PROFILE", "").strip()
+OPENCLI_SITE_SESSION = os.environ.get("QUARRY_OPENCLI_SITE_SESSION", "persistent").strip()
 AI_ENGINE = os.environ.get("AI_ENGINE", "codex").lower()  # codex | ark | none
 ARK_MODEL = os.environ.get("ARK_MODEL", "doubao-seed-1-6-250615")
 ARK_BASE = os.environ.get("ARK_BASE", "https://ark.cn-beijing.volces.com/api/v3")
@@ -140,6 +149,23 @@ TASKS: dict = {}      # taskId -> {stage, progress, message, postId, topic, warn
 IMPORT_SEM = threading.Semaphore(
     int(os.environ.get("QUARRY_IMPORT_CONCURRENCY") or os.environ.get("TV_IMPORT_CONCURRENCY", "2"))
 )
+# 浏览器闸：复用标签页时，同一平台同时只允许一条 opencli 命令在跑。
+# 一是同站命令共用一个标签页，并发会把彼此的页面导航掉；
+# 二是同站串行后，一个平台从头到尾只占一个标签页，不会一条命令弹一次窗。
+# 不同平台之间互不影响，仍然可以并行。
+_SITE_LOCKS: dict = {}
+_SITE_LOCKS_GUARD = threading.Lock()
+
+
+def _site_lock(site: str):
+    if OPENCLI_SITE_SESSION != "persistent":
+        return contextlib.nullcontext()
+    with _SITE_LOCKS_GUARD:
+        lock = _SITE_LOCKS.get(site)
+        if lock is None:
+            lock = _SITE_LOCKS[site] = threading.Lock()
+        return lock
+
 
 # ---------------------------------------------------------------------------
 # 帖子存取 + 种子
@@ -621,10 +647,30 @@ def detect_platform(url: str) -> dict:
 
 
 def run_opencli_site(site: str, args, timeout=120):
-    cmd = [OPENCLI, site] + args
-    return subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=timeout, stdin=subprocess.DEVNULL,
-                          cwd=VAULT_ROOT)
+    """所有 opencli 调用的唯一出口。
+
+    窗口/profile/会话这三个"别来打扰我"的开关在这里统一注入，调用方不用各自记得写，
+    也就不会再出现某条命令漏了 --window background 就把浏览器怼到最前面的情况。
+    """
+    args = list(args)
+    cmd = [OPENCLI]
+    if OPENCLI_PROFILE:
+        cmd += ["--profile", OPENCLI_PROFILE]
+    cmd += [site] + args
+    if OPENCLI_WINDOW and "--window" not in args:
+        cmd += ["--window", OPENCLI_WINDOW]
+    if OPENCLI_SITE_SESSION and "--site-session" not in args:
+        cmd += ["--site-session", OPENCLI_SITE_SESSION]
+    # 命令行参数之外再兜一层环境变量：opencli 内部再起子命令时也照样是背景窗口
+    env = dict(os.environ)
+    if OPENCLI_WINDOW:
+        env["OPENCLI_WINDOW"] = OPENCLI_WINDOW
+    if OPENCLI_PROFILE:
+        env["OPENCLI_PROFILE"] = OPENCLI_PROFILE
+    with _site_lock(site):
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL,
+                              cwd=VAULT_ROOT, env=env)
 
 
 def run_opencli(args, timeout=120):
@@ -632,8 +678,7 @@ def run_opencli(args, timeout=120):
 
 
 def fetch_thread(tid: str):
-    p = run_opencli(["thread", tid, "--limit", "1", "-f", "json",
-                     "--window", "background"])
+    p = run_opencli(["thread", tid, "--limit", "1", "-f", "json"])
     if p.returncode != 0:
         raise RuntimeError(f"opencli thread 失败(exit {p.returncode}): {p.stderr[:200]}")
     data = json.loads(p.stdout)
@@ -643,7 +688,7 @@ def fetch_thread(tid: str):
 
 
 def fetch_article(tid: str):
-    p = run_opencli(["article", tid, "-f", "json", "--window", "background"])
+    p = run_opencli(["article", tid, "-f", "json"])
     if p.returncode != 0:
         return None
     try:
@@ -991,6 +1036,34 @@ def _finish_ai(post: dict, text: str, handle: str, platform: str, warnings: list
             save_posts()
 
 
+def fetch_bilibili_view(bvid: str) -> dict:
+    """B 站稿件详情走公开接口拿，不占浏览器。
+
+    标题/简介/封面/UP 主/播放点赞收藏评论分享这一整套都在这个接口里，且不需要登录。
+    拿不到就返回 {}，调用方自己退回 opencli。
+    """
+    if not re.fullmatch(r"BV[0-9A-Za-z]+", bvid or ""):
+        return {}
+    api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+    try:
+        req = urllib.request.Request(api, headers={
+            "User-Agent": UA, "Referer": f"https://www.bilibili.com/video/{bvid}/"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    meta = dict(data)
+    pubdate = data.get("pubdate")
+    if isinstance(pubdate, (int, float)) and pubdate > 0:
+        meta["published"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(pubdate)))
+    return meta
+
+
 def _bili_rows_to_timeline(rows: list) -> str:
     """B 站字幕行转 "[MM:SS] 文本" 时间轴格式；无时间信息时退回纯文本行。"""
     lines = []
@@ -1019,15 +1092,17 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         return
 
     set_task(task_id, stage="fetching", topic=topic_id, message="正在抓取 B 站视频信息")
-    meta = {}
-    p = run_opencli_site("bilibili", ["video", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
-    if p.returncode == 0:
-        try:
-            meta = normalize_opencli_kv(json.loads(p.stdout))
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"B 站元数据解析失败：{e}")
-    else:
-        warnings.append(f"B 站元数据抓取失败：{p.stderr[:120]}")
+    # 标题/简介/封面/UP 主/互动数据走 B 站公开接口，不用开浏览器；失败才退回 opencli
+    meta = fetch_bilibili_view(bvid)
+    if not meta:
+        p = run_opencli_site("bilibili", ["video", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
+        if p.returncode == 0:
+            try:
+                meta = normalize_opencli_kv(json.loads(p.stdout))
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"B 站元数据解析失败：{e}")
+        else:
+            warnings.append(f"B 站元数据抓取失败：{p.stderr[:120]}")
     title = str(meta.get("title") or meta.get("标题") or f"Bilibili {bvid}")
     owner = meta.get("owner")
     if isinstance(owner, dict):
@@ -1053,7 +1128,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     os.makedirs(video_dir, exist_ok=True)
     before = snapshot_files(video_dir)
     dl = run_opencli_site("bilibili", ["download", bvid, "--output", video_dir,
-                                      "-f", "json", "--window", "background"], timeout=1200)
+                                      "-f", "json"], timeout=1200)
     if dl.returncode != 0:
         warnings.append(f"视频本体下载失败：{(dl.stderr or dl.stdout or '')[:120]}")
     v_media, v_name, _ = _first_existing_media(collect_downloaded_files(video_dir, before))
@@ -1063,7 +1138,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     set_task(task_id, stage="transcribing", topic=topic_id, message="正在获取字幕/总结", warnings=warnings)
     transcript = ""
     transcript_source = ""
-    sub = run_opencli_site("bilibili", ["subtitle", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+    sub = run_opencli_site("bilibili", ["subtitle", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
     if sub.returncode == 0:
         try:
             rows = json.loads(sub.stdout)
@@ -1072,7 +1147,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         except Exception as e:  # noqa: BLE001
             warnings.append(f"字幕解析失败：{e}")
     if not transcript:
-        summ = run_opencli_site("bilibili", ["summary", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+        summ = run_opencli_site("bilibili", ["summary", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
         if summ.returncode == 0:
             try:
                 rows = json.loads(summ.stdout)
@@ -1135,7 +1210,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
 
     set_task(task_id, stage="fetching", topic=topic_id, message="正在抓取小红书笔记信息")
     meta = {}
-    p = run_opencli_site("xiaohongshu", ["note", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+    p = run_opencli_site("xiaohongshu", ["note", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
     if p.returncode == 0:
         try:
             meta = normalize_opencli_kv(json.loads(p.stdout))
@@ -1148,7 +1223,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
     output_dir = os.path.join(MEDIA_DIR, "xiaohongshu", note_id)
     os.makedirs(output_dir, exist_ok=True)
     before = snapshot_files(output_dir)
-    dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", output_dir, "-f", "json", "--window", "background"], timeout=180)
+    dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", output_dir, "-f", "json"], timeout=180)
     if dl.returncode != 0:
         warnings.append(f"小红书媒体下载失败：{dl.stderr[:120]}")
     files = collect_downloaded_files(output_dir, before)
@@ -1203,7 +1278,7 @@ def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
     """策略 A：链接里带 sec_uid（用户页 modal 链接）时，从作品列表精确匹配。"""
     p = run_opencli_site("douyin", ["user-videos", sec_uid, "--limit", "20",
                                    "--with_comments", "true", "--comment_limit", "5",
-                                   "-f", "json", "--window", "background"], timeout=240)
+                                   "-f", "json"], timeout=240)
     if p.returncode != 0:
         raise RuntimeError(f"opencli douyin user-videos 失败：{(p.stderr or '')[:120]}")
     rows = json.loads(p.stdout)
