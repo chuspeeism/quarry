@@ -23,6 +23,9 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
 
 转写：视频类内容自动走 ASR 四件套（mp4+m4a+srt+口播词.md），见 asr.py；TV_ASR=none 关闭。
 
+互动数据：收藏（下载）时抓取当下的浏览量/点赞/收藏/评论/分享，统一存进帖子的
+  stats 字段 {views,likes,collects,comments,shares,capturedAt}，各平台缺哪项就不存哪项。
+
 数据：
   data/posts.json        v2 持久化课题与帖子；首启从 post_content_dataset.json 种子导入
   data/media/            新帖下载的媒体
@@ -200,6 +203,7 @@ def normalize_post(post: dict, topic_id: str = DEFAULT_TOPIC_ID) -> dict:
     for key in ("transcriptSrtPath", "transcriptMdPath", "audioPath", "transcriptSource"):
         p[key] = str(p.get(key) or "")
     p["rawMeta"] = p.get("rawMeta") if isinstance(p.get("rawMeta"), dict) else {}
+    p["stats"] = p.get("stats") if isinstance(p.get("stats"), dict) else {}
     uid = str(p.get("uid") or make_uid(p["topic"], p))
     p["uid"] = uid
     p["id"] = uid
@@ -232,7 +236,7 @@ def compact_meta(platform: str, meta: dict) -> dict:
     if not isinstance(meta, dict):
         return {}
     allowed = {
-        "x": {"id", "author", "text", "created_at", "url", "likes", "retweets", "media_urls"},
+        "x": {"id", "author", "text", "created_at", "url", "likes", "retweets", "replies", "views", "bookmarks", "quotes", "media_urls"},
         "bilibili": {"bvid", "aid", "cid", "title", "author", "owner", "duration", "stat", "pic", "thumbnail", "desc", "description", "publish_time", "canonicalUrl"},
         "xiaohongshu": {"noteId", "title", "desc", "author", "likedCount", "collectedCount", "commentCount", "canonicalUrl"},
         "douyin": {"awemeId", "desc", "author", "shareUrl", "canonicalUrl"},
@@ -245,6 +249,94 @@ def compact_meta(platform: str, meta: dict) -> dict:
                 out[key] = val
             elif isinstance(val, (list, dict)):
                 out[key] = json.dumps(val, ensure_ascii=False)[:RAW_META_LIMIT * 20]
+    return out
+
+
+# 收藏时点的互动数据快照：浏览/点赞/收藏/评论/分享。
+# 各平台字段名差异很大（英文/中文/嵌套 stat 结构），这里统一按候选键提取成整数。
+STATS_KEY_CANDIDATES = {
+    "x": {
+        "views": ("views", "view_count", "impressions"),
+        "likes": ("likes", "favorite_count", "like_count"),
+        "collects": ("bookmarks", "bookmark_count"),
+        "comments": ("replies", "reply_count", "comments"),
+        "shares": ("retweets", "retweet_count", "reposts"),
+    },
+    "bilibili": {
+        "views": ("view", "play", "views", "播放量", "播放", "播放数"),
+        "likes": ("like", "likes", "点赞", "点赞数"),
+        "collects": ("favorite", "favourite", "collect", "收藏", "收藏数"),
+        "comments": ("reply", "comment", "评论", "评论数"),
+        "shares": ("share", "分享", "分享数", "转发"),
+    },
+    "xiaohongshu": {
+        "views": ("viewCount", "view_count", "浏览量", "浏览"),
+        "likes": ("likedCount", "liked_count", "likes", "点赞", "点赞数"),
+        "collects": ("collectedCount", "collected_count", "收藏", "收藏数"),
+        "comments": ("commentCount", "comment_count", "comments", "评论", "评论数"),
+        "shares": ("shareCount", "share_count", "分享", "分享数"),
+    },
+    "douyin": {
+        "views": ("play_count", "playCount", "views"),
+        "likes": ("digg_count", "diggCount", "like_count", "likes"),
+        "collects": ("collect_count", "collectCount", "favorite_count"),
+        "comments": ("comment_count", "commentCount", "comments"),
+        "shares": ("share_count", "shareCount", "forward_count"),
+    },
+}
+
+
+def _coerce_count(val):
+    """把 12000 / '3,456' / '1.2万' / '8.5w' 之类的计数统一成 int；无法解析返回 None。"""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val) if val >= 0 else None
+    if isinstance(val, str):
+        s = val.strip().replace(",", "").replace("+", "")
+        if not s or s in ("-", "—"):
+            return None
+        mult = 1
+        if s.endswith("亿"):
+            mult, s = 100000000, s[:-1]
+        elif s.endswith(("万", "w", "W")):
+            mult, s = 10000, s[:-1]
+        elif s.endswith(("k", "K")):
+            mult, s = 1000, s[:-1]
+        try:
+            n = float(s)
+        except ValueError:
+            return None
+        return int(n * mult) if n >= 0 else None
+    return None
+
+
+def build_stats(platform: str, meta: dict) -> dict:
+    """从平台元数据提取下载时点的互动数据；一个都没拿到时返回 {}。"""
+    if not isinstance(meta, dict):
+        return {}
+    merged = dict(meta)
+    # B 站 stat / 抖音 statistics 是嵌套结构（有时被序列化成 JSON 字符串），摊平后一起找
+    for nest_key in ("stat", "statistics"):
+        nested = merged.get(nest_key)
+        if isinstance(nested, str):
+            try:
+                nested = json.loads(nested)
+            except Exception:  # noqa: BLE001
+                nested = None
+        if isinstance(nested, dict):
+            for k, v in nested.items():
+                merged.setdefault(k, v)
+    out = {}
+    for field, keys in STATS_KEY_CANDIDATES.get(platform, {}).items():
+        for key in keys:
+            if key in merged:
+                n = _coerce_count(merged.get(key))
+                if n is not None:
+                    out[field] = n
+                    break
+    if out:
+        out["capturedAt"] = now_ts()
     return out
 
 
@@ -681,6 +773,7 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
         created = item.get("created_at") or ""
         media_urls = _as_list(item.get("media_urls"))
         canonical = item.get("url") or url
+        stats = build_stats("x", item)
 
         article = None
         if not text and not media_urls:
@@ -752,6 +845,7 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
             "audioPath": tr["audioPath"],
             "transcriptSource": tr["transcriptSource"],
             "downloadStatus": "success" if media_path or image_path else ("partial" if remote else "skipped"),
+            "stats": stats,
             "rawMeta": compact_meta("x", item),
             "aiStatus": "pending",
             "warnings": warnings,
@@ -918,6 +1012,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         owner = owner.get("name") or owner.get("uname") or owner.get("mid")
     author = str(meta.get("author") or owner or meta.get("UP主") or "")
     pic = str(meta.get("thumbnail") or meta.get("pic") or meta.get("封面") or "")
+    stats = build_stats("bilibili", meta)
 
     set_task(task_id, stage="downloading", topic=topic_id, message="正在保存封面", warnings=warnings)
     media_path = media_name = image_path = ""
@@ -996,6 +1091,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": transcript_source,
         "downloadStatus": "success" if image_path or media_path else "skipped",
+        "stats": stats,
         "rawMeta": compact_meta("bilibili", {**meta, "bvid": bvid, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
     }
@@ -1039,6 +1135,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
     title = str(meta.get("title") or meta.get("标题") or "小红书笔记")
     body_text = str(meta.get("desc") or meta.get("正文") or meta.get("description") or "")
     author = str(meta.get("author") or meta.get("作者") or "")
+    stats = build_stats("xiaohongshu", meta)
 
     # 视频笔记：本地 ASR 转写口播（四件套）
     tr = {"transcript": "", "transcriptSrtPath": "", "transcriptMdPath": "",
@@ -1066,6 +1163,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
         "downloadStatus": "success" if image_path or media_path else ("failed" if dl.returncode != 0 else "skipped"),
+        "stats": stats,
         "rawMeta": compact_meta("xiaohongshu", {**meta, "noteId": note_id, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
     }
@@ -1099,6 +1197,7 @@ def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
                 "cover": "",
                 "createTime": "",
                 "comments": r.get("top_comments") if isinstance(r.get("top_comments"), list) else [],
+                "stats": build_stats("douyin", r),
             }
     return None
 
@@ -1157,6 +1256,7 @@ def _douyin_meta_from_share_page(aweme_id: str):
         "cover": str(cover_list[0]) if cover_list else "",
         "createTime": published,
         "comments": [],
+        "stats": build_stats("douyin", item),
     }
 
 
@@ -1174,6 +1274,7 @@ def _douyin_placeholder(task_id: str, url: str, topic_id: str, detected: dict, w
         "originalIsExcerpt": False, "originalNote": "", "keywords": ["抖音", "待解析", "视频链接"], "supplement": "",
         "sourceLink": detected.get("canonicalUrl") or url, "mediaPath": "", "mediaName": "", "imagePath": "",
         "remoteMedia": [], "articleLinks": [], "transcript": "", "downloadStatus": "skipped",
+        "stats": {},
         "rawMeta": compact_meta("douyin", {"awemeId": external_id, "shareUrl": url, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "skipped", "warnings": warnings, "source": "added", "addedAt": now_ts(),
     }
@@ -1292,6 +1393,7 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
         "downloadStatus": "success" if media_path else ("partial" if image_path else "failed"),
+        "stats": meta.get("stats") or {},
         "rawMeta": compact_meta("douyin", {"awemeId": aweme_id, "desc": meta["desc"][:200],
                                           "author": meta["author"], "shareUrl": url, "canonicalUrl": canonical}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
