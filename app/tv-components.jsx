@@ -158,6 +158,86 @@ function Row({ post, onOpen }) {
   );
 }
 
+/* ---------------- pending collect card（收藏进行中的占位卡） ---------------- */
+// 粘贴链接后立即插入列表顶部：抓取/AI 的实时进度都显示在卡片里，
+// 完成后由 App 刷新替换成真实帖子卡；失败则原地显示错误 + 重试/移除。
+function shortLink(u) {
+  const s = String(u || "").replace(/^https?:\/\//, "");
+  return s.length > 44 ? s.slice(0, 28) + "…" + s.slice(-13) : s;
+}
+
+function PendingCard({ item, dense, onRetry, onRemove }) {
+  const pid = item.platform;
+  const p = pid ? PLATFORMS[pid] : null;
+  const pc = pid ? platformVarColor(pid) : "var(--x)";
+  const isErr = item.status === "error";
+  const pct = Math.max(0, Math.min(100, Math.round(item.progress || 0)));
+  return hh("div", { className: "tv-card tv-pcard" + (dense ? " dense" : "") + (isErr ? " is-error" : "") },
+    hh("div", { className: "tv-thumb-wrap" },
+      hh("div", { className: "tv-thumb", style: { "--pc": pc } },
+        isErr ? null : hh("div", { className: "tv-pcard-sheen" }),
+        p ? hh("span", { className: "tv-thumb-pf" }, hh(PfChip, { id: pid }), p.label) : null,
+        hh("span", { className: "tv-thumb-type" }, isErr ? "失败" : "收藏中"),
+        hh("div", { className: "tv-thumb-icon" },
+          hh("div", { className: "ring" },
+            hh(Icon, { name: isErr ? "close" : "refresh", size: 22,
+              style: isErr ? { color: "#e0563f" } : { animation: "spin 1.1s linear infinite" } })))
+      )
+    ),
+    hh("div", { className: "tv-card-body" },
+      hh("div", { className: "tv-pcard-url", title: item.url }, shortLink(item.url)),
+      isErr
+        ? hh("div", { className: "tv-pcard-err" }, item.message || "收藏失败")
+        : hh("div", null,
+            hh("div", { className: "tv-batch-bar" },
+              hh("span", { className: "fill", style: { width: Math.max(4, pct) + "%" } })),
+            hh("div", { className: "tv-pcard-msg" }, item.message || "处理中…")),
+      hh("div", { className: "tv-card-foot tv-pcard-foot" },
+        isErr
+          ? hh(React.Fragment, null,
+              hh("button", { className: "tv-pcard-act", onClick: () => onRetry(item.key) }, "重试"),
+              hh("button", { className: "tv-pcard-act danger", onClick: () => onRemove(item.key) }, "移除"))
+          : hh(React.Fragment, null,
+              hh("span", { className: "tv-kw" },
+                hh(Icon, { name: "refresh", size: 12, style: { animation: "spin 1.1s linear infinite" } }), pct + "%"),
+              hh("span", { className: "when" }, "后台抓取中"))
+      )
+    )
+  );
+}
+
+function PendingRow({ item, onRetry, onRemove }) {
+  const pid = item.platform;
+  const p = pid ? PLATFORMS[pid] : null;
+  const pc = pid ? platformVarColor(pid) : "var(--x)";
+  const isErr = item.status === "error";
+  const pct = Math.max(0, Math.min(100, Math.round(item.progress || 0)));
+  return hh("div", { className: "tv-row tv-prow" + (isErr ? " is-error" : "") },
+    hh("div", { className: "tv-row-thumb", style: { "--pc": pc } },
+      hh("div", { className: "mini" },
+        hh(Icon, { name: isErr ? "close" : "refresh", size: 16,
+          style: isErr ? { color: "#e0563f" } : { animation: "spin 1.1s linear infinite" } }))),
+    hh("div", { className: "tv-row-main" },
+      hh("div", { className: "t tv-pcard-url", title: item.url }, shortLink(item.url)),
+      isErr
+        ? hh("div", { className: "tv-pcard-err" }, item.message || "收藏失败")
+        : hh("div", null,
+            hh("div", { className: "tv-batch-bar" },
+              hh("span", { className: "fill", style: { width: Math.max(4, pct) + "%" } })),
+            hh("div", { className: "tv-pcard-msg" }, item.message || "处理中…"))
+    ),
+    hh("div", { className: "tv-row-side" },
+      isErr
+        ? hh(React.Fragment, null,
+            hh("button", { className: "tv-pcard-act", onClick: () => onRetry(item.key) }, "重试"),
+            hh("button", { className: "tv-pcard-act danger", onClick: () => onRemove(item.key) }, "移除"))
+        : hh(React.Fragment, null,
+            p ? hh("span", { className: "pf" }, hh(PfChip, { id: pid }), p.label) : null,
+            hh("span", { className: "when" }, pct + "%"))
+    )
+  );
+}
+
 /* ---------------- sidebar ---------------- */
 function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, togglePlatform,
                    typeFilter, toggleType, onNewTopic, total }) {
@@ -238,4 +318,4 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
   );
 }
 
-Object.assign(window, { Thumb, Card, Row, Sidebar, StatChips, StatIcon, statEntries, fmtCount });
+Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount });

@@ -535,6 +535,31 @@ button { color: inherit; background: none; border: 0; cursor: pointer; }
 .tv-batch-row.done .pct { color: color-mix(in oklab, var(--accent) 75%, #000); }
 .tv-batch-row.error .pct { color: #e0563f; }
 
+/* ============================================================ 收藏预览卡（粘贴链接后置顶的进行中占位卡） */
+.tv-pcard { border-style: dashed; border-color: var(--line-2); }
+.tv-pcard:hover { transform: none; box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+.tv-pcard.is-error { border-color: color-mix(in oklab, #e0563f 34%, var(--line-2)); background: color-mix(in oklab, #e0563f 5%, rgba(255,255,255,0.6)); }
+.tv-pcard-sheen { position: absolute; inset: 0; z-index: 1; transform: translateX(-100%); pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.55), transparent); animation: shimmer 1.4s infinite; }
+.tv-pcard-url { font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-pcard-msg { margin-top: 6px; font-size: 11.5px; line-height: 1.5; color: var(--muted); font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-pcard-err { font-size: 12px; line-height: 1.5; color: #e0563f; word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.tv-pcard-foot { gap: 8px; }
+.tv-pcard-act { height: 28px; padding: 0 12px; border-radius: 8px; font-size: 12px; font-weight: 650;
+  background: rgba(255,255,255,0.75); border: 1px solid var(--line-2); color: var(--ink-2); transition: .15s var(--ease); }
+.tv-pcard-act:hover { color: var(--ink); background: #fff; border-color: var(--line-strong, var(--line-2)); }
+.tv-pcard-act.danger { color: #e0563f; border-color: color-mix(in oklab, #e0563f 30%, var(--line-2)); }
+.tv-pcard-act.danger:hover { background: color-mix(in oklab, #e0563f 8%, #fff); color: #e0563f; }
+
+/* 列表视图的预览行 */
+.tv-prow { border-style: dashed; }
+.tv-prow:hover { transform: none; }
+.tv-prow.is-error { border-color: color-mix(in oklab, #e0563f 34%, var(--line-2)); background: color-mix(in oklab, #e0563f 5%, rgba(255,255,255,0.58)); }
+.tv-prow .tv-row-thumb .mini { position: absolute; inset: 0; display: grid; place-items: center; color: var(--ink-2); z-index: 1; }
+.tv-prow .tv-batch-bar { margin-top: 6px; max-width: 340px; }
+.tv-prow .tv-row-side .when { font-variant-numeric: tabular-nums; }
+
 /* ---- engagement stats（收藏时点互动数据快照） ---- */
 .tv-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
 .tv-stat { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
