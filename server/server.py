@@ -213,6 +213,31 @@ def make_platform_uid(topic_id: str, platform: str, external_id: str) -> str:
     return f"{topic_id}__{platform}__{slugify_post_id(external_id)}"
 
 
+def video_download_status(media_path: str, image_path: str, attempted: bool = True) -> str:
+    """视频类内容的下载完整度：以「视频本体」为准，封面不顶数。
+
+    封面下载成功、视频本体失败时必须是 partial —— 报 success 的话前端看不出
+    这条内容缺了正片，用户要等到点开播放才发现。
+    """
+    if media_path:
+        return "success"
+    if not attempted:
+        return "skipped"
+    return "partial" if image_path else "failed"
+
+
+def derive_download_status(post: dict) -> str:
+    """没有显式状态时（种子数据/历史字段缺失）按已存文件推断。
+
+    视频类走 video_download_status；其它类型有任意媒体就算完整，都没有算没下过。
+    """
+    media = str(post.get("mediaPath") or "")
+    image = str(post.get("imagePath") or "")
+    if str(post.get("contentType") or "") == "video":
+        return video_download_status(media, image, attempted=bool(media or image))
+    return "success" if (media or image) else "skipped"
+
+
 def normalize_post(post: dict, topic_id: str = DEFAULT_TOPIC_ID) -> dict:
     p = dict(post)
     p["topic"] = str(p.get("topic") or topic_id)
@@ -220,7 +245,7 @@ def normalize_post(post: dict, topic_id: str = DEFAULT_TOPIC_ID) -> dict:
     p["platform"] = str(p.get("platform") or "x")
     p["externalId"] = str(p.get("externalId") or p.get("tweetId") or p.get("uid") or p.get("id") or "")
     p["contentType"] = str(p.get("contentType") or ("post" if p["platform"] == "x" else "video"))
-    p["downloadStatus"] = str(p.get("downloadStatus") or ("success" if p.get("mediaPath") or p.get("imagePath") else "skipped"))
+    p["downloadStatus"] = str(p.get("downloadStatus") or derive_download_status(p))
     p["transcript"] = truncate_text(str(p.get("transcript") or ""))
     for key in ("transcriptSrtPath", "transcriptMdPath", "audioPath", "transcriptSource"):
         p[key] = str(p.get(key) or "")
@@ -821,6 +846,11 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
                 remote.append(u)
         if media_urls and not media_path and not image_path:
             warnings.append("全部媒体下载失败，已保留远程链接。")
+        # 只要有媒体没落地就不算完整：一条都没下来是 failed，下了一部分是 partial
+        if remote:
+            download_status = "partial" if (media_path or image_path) else "failed"
+        else:
+            download_status = "success" if (media_path or image_path) else "skipped"
 
         # 2.5) 视频口播转写（四件套：mp4 + m4a + srt + 口播词.md）
         title_seed = (article.get("title") if article else "") or f"@{username} 的帖子"
@@ -866,7 +896,7 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
             "transcriptMdPath": tr["transcriptMdPath"],
             "audioPath": tr["audioPath"],
             "transcriptSource": tr["transcriptSource"],
-            "downloadStatus": "success" if media_path or image_path else ("partial" if remote else "skipped"),
+            "downloadStatus": download_status,
             "stats": stats,
             "rawMeta": compact_meta("x", item),
             "aiStatus": "pending",
@@ -1059,6 +1089,9 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     v_media, v_name, _ = _first_existing_media(collect_downloaded_files(video_dir, before))
     if v_media:
         media_path, media_name = v_media, v_name
+    elif dl.returncode == 0:
+        # 退出码 0 但目录里没多出视频文件，同样是没拿到正片
+        warnings.append("视频本体下载未产出文件")
 
     set_task(task_id, stage="transcribing", topic=topic_id, message="正在获取字幕/总结", warnings=warnings)
     transcript = ""
@@ -1112,7 +1145,8 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": transcript,
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": transcript_source,
-        "downloadStatus": "success" if image_path or media_path else "skipped",
+        # 只下到封面不算 success：B 站帖必然是视频，正片缺了就是 partial
+        "downloadStatus": video_download_status(media_path, image_path),
         "stats": stats,
         "rawMeta": compact_meta("bilibili", {**meta, "bvid": bvid, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
@@ -1184,7 +1218,10 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
-        "downloadStatus": "success" if image_path or media_path else ("failed" if dl.returncode != 0 else "skipped"),
+        # 笔记可能是图文也可能是视频，拿不到「应该有几个文件」，只能按下载命令是否报错分档：
+        # 命令失败但落了几个文件 = partial，一个都没落 = failed
+        "downloadStatus": (("success" if dl.returncode == 0 else "partial") if (image_path or media_path)
+                           else ("failed" if dl.returncode != 0 else "skipped")),
         "stats": stats,
         "rawMeta": compact_meta("xiaohongshu", {**meta, "noteId": note_id, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
@@ -1414,7 +1451,7 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
-        "downloadStatus": "success" if media_path else ("partial" if image_path else "failed"),
+        "downloadStatus": video_download_status(media_path, image_path),
         "stats": meta.get("stats") or {},
         "rawMeta": compact_meta("douyin", {"awemeId": aweme_id, "desc": meta["desc"][:200],
                                           "author": meta["author"], "shareUrl": url, "canonicalUrl": canonical}),

@@ -296,7 +296,10 @@ collect_downloaded_files(output_dir, before_snapshot=None) -> list[path]
 - MVP 以“元数据 + 封面 + 字幕/总结 + 卡片入库”为完整闭环。
 - 如果要下载整片，建议用 `opencli bilibili download <url> --quality 480p --output ...`，并设置超时/失败 warning；下载失败不阻断卡片保存。
 - opencli download 返回的成功文件需要通过 `collect_downloaded_files()` 找到本地文件并映射到 `mediaPath`。
-- 若下载失败但元数据成功，仍保存卡片，`downloadStatus="failed"`，warning 显示。
+- 若下载失败但元数据成功，仍保存卡片，warning 显示。此时 `downloadStatus` 以**视频本体**为准，
+  封面下载成功不能顶数：拿到正片才是 `success`，只剩封面是 `partial`，两样都没有是 `failed`。
+  （见 `server.py` 的 `video_download_status()`；对视频类内容按「有任意媒体就算 success」判定，
+  会让「只存下封面」的帖子在前端看起来完好无损。）
 
 ### 8.3 Xiaohongshu importer
 

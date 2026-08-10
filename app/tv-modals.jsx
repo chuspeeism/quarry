@@ -1,4 +1,4 @@
-/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform, StatIcon, statEntries, fmtCount */
+/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform, StatIcon, statEntries, fmtCount, WarnIcon, downloadIssue */
 const { createElement: m, useState, useEffect, useRef } = React;
 
 /* ===================== detail media (placeholder, type-aware) ===================== */
@@ -116,6 +116,28 @@ function TranscriptView({ text }) {
   );
 }
 
+// 内容没抓全时的整条提示：说清缺了什么，并把后端记的 warnings 摊开给用户看。
+// warnings 里常混进 opencli/node 的 stderr，逐条截断，只列前几条。
+function DownloadNotice({ post }) {
+  const issue = downloadIssue(post);
+  if (!issue) return null;
+  const warns = (Array.isArray(post.warnings) ? post.warnings : [])
+    .map((w) => String(w || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  return m("div", { className: "tv-dlnote " + issue.tone },
+    m("span", { className: "ico" }, m(WarnIcon, { size: 15 })),
+    m("div", { style: { minWidth: 0 } },
+      m("b", null, issue.label),
+      m("p", null, issue.detail + "（可以删掉这条重新收藏，或点「打开原帖」去源站看。）"),
+      warns.length
+        ? m("ul", null, warns.map((w, i) =>
+            m("li", { key: i, title: w }, w.length > 120 ? w.slice(0, 120) + "…" : w)))
+        : null
+    )
+  );
+}
+
 /* ===================== detail lightbox ===================== */
 function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, onDeleted, onEdited }) {
   const pc = platformVarColor(post.platform);
@@ -180,6 +202,7 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
               : null
           ),
           m("h2", { className: "tv-detail-title" }, post.title),
+          m(DownloadNotice, { post }),
           m(DetailStats, { stats: post.stats }),
           mode === "transcript"
             ? m(TranscriptView, { text: post.transcript })
@@ -450,4 +473,4 @@ function NewTopicModal({ onClose, onCreate }) {
   );
 }
 
-Object.assign(window, { Detail, EditModal, CollectModal, NewTopicModal });
+Object.assign(window, { Detail, EditModal, CollectModal, NewTopicModal, DownloadNotice });
