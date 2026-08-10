@@ -14,7 +14,7 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
   GET    /api/topics          列出课题 {topics:[...]}
   POST   /api/topics          创建课题 {name,id?}
   PATCH  /api/topics/<id>     编辑课题 {name?,description?}
-  DELETE /api/topics/<id>     删除课题（非空需 ?force=1）
+  DELETE /api/topics/<id>     删除课题（非空需 ?force=1；?media=1 连本地媒体一起删）
   GET    /api/posts           列出帖子 {posts:[...]}，支持 ?topic=<id>
   PATCH  /api/posts/<uid>     编辑帖子 {title?,body?,summary?,keywords?,supplement?}
   DELETE /api/posts/<uid>     删除帖子（?media=1 连本地媒体一起删）
@@ -1797,6 +1797,25 @@ class Handler(BaseHTTPRequestHandler):
                 dirs.add(os.path.dirname(full))
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"文件删除失败：{rel} ({e})")
+        # 关键帧是一整个目录（<视频名>.关键帧/），不在上面按文件删的清单里，
+        # 漏掉的话每删一条视频就在内容层留下一整目录静帧（存量 38 个目录 8MB 量级）。
+        # 这里不能走 _safe_local_path：它是按文件找的，目录命中不了 isfile，
+        # 会回落到第一个根（产品层 app/）的候选路径，导致这段静默不生效。
+        frames_rel = str(post.get("framesDir") or "")
+        if frames_rel:
+            full = os.path.normpath(os.path.join(VAULT_ROOT, frames_rel))
+            # 只删自己抽帧产出的目录：normpath 后必须仍在内容层内，且带抽帧后缀
+            if not full.startswith(VAULT_ROOT + os.sep):
+                warnings.append(f"关键帧目录越界，未删除：{frames_rel}")
+            elif os.path.isdir(full):
+                if not os.path.basename(full).endswith(keyframes.FRAMES_SUFFIX):
+                    warnings.append(f"关键帧目录名不符合抽帧命名，未删除：{frames_rel}")
+                else:
+                    try:
+                        shutil.rmtree(full)
+                        dirs.add(os.path.dirname(full))
+                    except Exception as e:  # noqa: BLE001
+                        warnings.append(f"关键帧目录删除失败：{frames_rel} ({e})")
         # 清理因此变空的媒体子目录（仅 data/media 之下）
         for d in dirs:
             try:
@@ -1826,6 +1845,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/topics/"):
             topic_id = unquote(path[len("/api/topics/"):])
             force = (query.get("force") or ["0"])[0] in ("1", "true", "yes")
+            with_media = (query.get("media") or ["0"])[0] in ("1", "true", "yes")
             with LOCK:
                 topic = next((t for t in TOPICS if t.get("id") == topic_id), None)
                 if not topic:
@@ -1841,7 +1861,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not TOPICS:
                     TOPICS.append(make_default_topic())
                 save_posts()
-            self._send_json({"ok": True, "removed": topic_id, "removedPosts": len(related)})
+            # 连帖子一起删时，媒体文件也一并清理，否则内容层会留下没人引用的孤儿文件
+            warnings = []
+            if with_media:
+                for p in related:
+                    warnings.extend(self._delete_post_files(p))
+            self._send_json({"ok": True, "removed": topic_id,
+                             "removedPosts": len(related), "warnings": warnings})
             return
         self.send_error(404, "Not Found")
 

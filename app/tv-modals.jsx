@@ -1,4 +1,4 @@
-/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform, StatIcon, statEntries, fmtCount, WarnIcon, downloadIssue */
+/* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, Thumb, typeMeta, initials, relTime, detectPlatform, StatIcon, statEntries, fmtCount, WarnIcon, downloadIssue, localFileCount */
 const { createElement: m, useState, useEffect, useRef } = React;
 
 /* ===================== detail media (placeholder, type-aware) ===================== */
@@ -68,23 +68,7 @@ function DetailMedia({ post, pc, p, tm }) {
   );
 }
 
-/* ===================== detail extras: icons + transcript ===================== */
-// 编辑/删除图标：tv-icons.jsx 不在本次可改文件清单里，
-// 这里按其同款 24-grid stroke 风格在本文件内补充两枚。
-const EXTRA_ICON_PATHS = {
-  edit: "M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z",
-  trash: "M4 6h16M9 6V4h6v2M6 6l1 14h10l1-14M10 10.5v5.5M14 10.5v5.5",
-  copy: "M9 9h10v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V9ZM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
-  check: "M5 12l4 4 10-10",
-};
-function ExtraIcon({ name, size = 15, style }) {
-  return m("svg", {
-    width: size, height: size, viewBox: "0 0 24 24", style,
-    fill: "none", stroke: "currentColor",
-    strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round",
-  }, m("path", { d: EXTRA_ICON_PATHS[name] || "" }));
-}
-
+/* ===================== detail extras: transcript + stats ===================== */
 // 收藏时点的互动数据条：浏览/点赞/收藏/评论/分享 + 抓取时间标注
 function DetailStats({ stats }) {
   const list = statEntries(stats);
@@ -157,15 +141,19 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
     : "";
 
   const [confirmDel, setConfirmDel] = useState(false);
+  const [delAck, setDelAck] = useState(false);
   const [delMedia, setDelMedia] = useState(true);
   const [delBusy, setDelBusy] = useState(false);
   const [delErr, setDelErr] = useState("");
   const [editing, setEditing] = useState(false);
   const [copied, setCopied] = useState("");
+  // 和卡片上的确认层同一道闸：删除不可恢复，必须先勾「我确认」
+  const delFileCount = localFileCount(post);
 
   // 前后翻帖时重置删除确认条与编辑弹窗，避免误操作到另一条
   useEffect(() => {
-    setConfirmDel(false); setDelMedia(true); setDelBusy(false); setDelErr(""); setEditing(false);
+    setConfirmDel(false); setDelAck(false); setDelMedia(true);
+    setDelBusy(false); setDelErr(""); setEditing(false);
     setCopied("");
   }, [uid]);
 
@@ -183,10 +171,10 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
   };
 
   async function doDelete() {
-    if (delBusy) return;
+    if (delBusy || !delAck) return;
     setDelBusy(true); setDelErr("");
     try {
-      await window.TVApi.deletePost(uid, delMedia);
+      await window.TVApi.deletePost(uid, delMedia && delFileCount > 0);
       if (onDeleted) onDeleted(post);
     } catch (err) {
       setDelBusy(false);
@@ -233,17 +221,21 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
         confirmDel
           ? m("div", { className: "tv-del-confirm" },
               m("div", { className: "tv-del-row" },
-                m("span", { className: "warn" }, m(ExtraIcon, { name: "trash", size: 14 })),
+                m("span", { className: "warn" }, m(Icon, { name: "trash", size: 14 })),
                 m("div", { className: "msg" },
                   m("b", null, "删除这条收藏？"),
-                  m("label", { className: "opt" },
+                  m("label", { className: "opt strong" },
+                    m("input", { type: "checkbox", checked: delAck, disabled: delBusy,
+                      onChange: (e) => setDelAck(e.target.checked) }),
+                    "我确认删除，不可恢复"),
+                  delFileCount ? m("label", { className: "opt" },
                     m("input", { type: "checkbox", checked: delMedia, disabled: delBusy,
                       onChange: (e) => setDelMedia(e.target.checked) }),
-                    "同时删除本地媒体文件")
+                    "同时删除 " + delFileCount + " 个本地文件") : null
                 ),
                 m("button", { className: "tv-btn ghost sm", disabled: delBusy,
-                  onClick: () => { setConfirmDel(false); setDelErr(""); } }, "取消"),
-                m("button", { className: "tv-btn danger sm", disabled: delBusy, onClick: doDelete },
+                  onClick: () => { setConfirmDel(false); setDelAck(false); setDelErr(""); } }, "取消"),
+                m("button", { className: "tv-btn danger sm", disabled: delBusy || !delAck, onClick: doDelete },
                   delBusy ? "删除中…" : "确认删除")
               ),
               delErr ? m("div", { className: "tv-del-err" }, delErr) : null
@@ -255,13 +247,13 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
                 title: copied === "err" ? "复制失败" : "复制这一条给 AI（按住 Shift 不带口播转写）",
                 onClick: doCopy,
               },
-                m(ExtraIcon, { name: copied === "ok" ? "check" : "copy", size: 15 }),
+                m(Icon, { name: copied === "ok" ? "check" : "copy", size: 15 }),
                 m("span", null, copied === "ok" ? "已复制" : copied === "err" ? "失败" : "复制给 AI")),
               m("button", { className: "tv-foot-act", title: "编辑", onClick: () => setEditing(true) },
-                m(ExtraIcon, { name: "edit", size: 15 })),
+                m(Icon, { name: "edit", size: 15 })),
               m("button", { className: "tv-foot-act danger", title: "删除",
                 onClick: () => { setDelErr(""); setConfirmDel(true); } },
-                m(ExtraIcon, { name: "trash", size: 15 })),
+                m(Icon, { name: "trash", size: 15 })),
               post.sourceLink
                 ? m("a", { className: "tv-open", href: post.sourceLink, target: "_blank", rel: "noreferrer" }, m(Icon, { name: "external", size: 14 }), "打开原帖")
                 : null
@@ -324,7 +316,7 @@ function EditModal({ post, onClose, onSaved }) {
     m("div", { className: "tv-modal tv-edit-modal" },
       m("button", { className: "tv-detail-x", onClick: onClose, style: { top: 16, right: 16 } }, m(Icon, { name: "close", size: 16 })),
       m("div", { className: "tv-modal-head" },
-        m("div", { className: "mi" }, m(ExtraIcon, { name: "edit", size: 18 })),
+        m("div", { className: "mi" }, m(Icon, { name: "edit", size: 18 })),
         m("div", null,
           m("h3", null, "编辑收藏"),
           m("p", null, "修改这条收藏的标题、正文、摘要、关键词与补充说明。"))
@@ -497,4 +489,131 @@ function NewTopicModal({ onClose, onCreate }) {
   );
 }
 
-Object.assign(window, { Detail, EditModal, CollectModal, NewTopicModal, DownloadNotice });
+/* ===================== rename topic（课题改名 / 改描述） ===================== */
+// 只改展示名和描述：课题 id 是帖子的归属键，改了会把已有收藏全部孤儿化，所以固定不动。
+function TopicEditModal({ topic, onClose, onSaved }) {
+  const [name, setName] = useState(topic.name || "");
+  const [desc, setDesc] = useState(topic.description || "");
+  const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const ref = useRef(null);
+  const mounted = useRef(true);
+  useEffect(() => { if (ref.current) { ref.current.focus(); ref.current.select(); } }, []);
+  useEffect(() => () => { mounted.current = false; }, []);
+
+  const dirty = name.trim() !== (topic.name || "") || desc.trim() !== (topic.description || "");
+
+  // PATCH /api/topics/<id>：保存成功后由上层刷新课题列表 + toast
+  async function submit() {
+    const nm = name.trim();
+    if (!nm || busy || !dirty) return;
+    setBusy(true); setErrorMsg("");
+    try {
+      const updated = await window.TVApi.updateTopic(topic.id, { name: nm, description: desc.trim() });
+      if (!mounted.current) return;
+      onSaved(updated || { ...topic, name: nm, description: desc.trim() });
+    } catch (err) {
+      if (!mounted.current) return;
+      setErrorMsg((err && err.message) || "保存失败");
+      setBusy(false);
+    }
+  }
+
+  return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget && !busy) onClose(); } },
+    m("div", { className: "tv-modal" },
+      m("button", { className: "tv-detail-x", onClick: onClose, style: { top: 16, right: 16 } }, m(Icon, { name: "close", size: 16 })),
+      m("div", { className: "tv-modal-head" },
+        m("div", { className: "mi" }, m(Icon, { name: "edit", size: 19 })),
+        m("div", null,
+          m("h3", null, "重命名课题"),
+          m("p", null, "课题 ID ", m("code", { className: "tv-code" }, topic.id),
+            " 不变（收藏按 ID 归属），这里只改显示名称和描述。"))
+      ),
+      m("div", { className: "tv-modal-body" },
+        m("div", { className: "tv-field" },
+          m("label", null, "课题名称"),
+          m("input", { ref, value: name, onChange: (e) => setName(e.target.value),
+            onKeyDown: (e) => { if (e.key === "Enter" && name.trim()) submit(); } })
+        ),
+        m("div", { className: "tv-field" },
+          m("label", null, "描述（可选）"),
+          m("textarea", { value: desc, placeholder: "这个课题收集什么内容？", onChange: (e) => setDesc(e.target.value) })
+        ),
+        errorMsg ? m("div", { className: "tv-field-error" }, errorMsg) : null
+      ),
+      m("div", { className: "tv-modal-foot" },
+        m("div", { className: "spacer" }),
+        m("button", { className: "tv-btn ghost", onClick: onClose, disabled: busy }, "取消"),
+        m("button", { className: "tv-btn primary", disabled: !name.trim() || !dirty || busy, onClick: submit },
+          m(Icon, { name: busy ? "refresh" : "check", size: 15 }), busy ? "保存中…" : "保存修改")
+      )
+    )
+  );
+}
+
+/* ===================== delete topic（删课题，非空要二次确认） ===================== */
+// 删除是不可恢复的（posts.json 直接改写），所以非空课题必须显式勾选确认，
+// 默认连带清理本地媒体，否则内容层会留下一堆没人引用的孤儿文件。
+function TopicDeleteModal({ topic, isLast, onClose, onDeleted }) {
+  const count = topic.count || 0;
+  const [ack, setAck] = useState(false);
+  const [withMedia, setWithMedia] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
+
+  const blocked = count > 0 && !ack;
+
+  async function submit() {
+    if (busy || blocked) return;
+    setBusy(true); setErrorMsg("");
+    try {
+      const res = await window.TVApi.deleteTopic(topic.id, count > 0, count > 0 && withMedia);
+      if (!mounted.current) return;
+      onDeleted(topic, (res && res.removedPosts) || 0);
+    } catch (err) {
+      if (!mounted.current) return;
+      setErrorMsg((err && err.message) || "删除失败");
+      setBusy(false);
+    }
+  }
+
+  return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget && !busy) onClose(); } },
+    m("div", { className: "tv-modal" },
+      m("button", { className: "tv-detail-x", onClick: onClose, style: { top: 16, right: 16 } }, m(Icon, { name: "close", size: 16 })),
+      m("div", { className: "tv-modal-head" },
+        m("div", { className: "mi danger" }, m(Icon, { name: "trash", size: 19 })),
+        m("div", null,
+          m("h3", null, "删除课题「" + topic.name + "」"),
+          m("p", null, count
+            ? "这个课题下还有 " + count + " 条收藏，删除课题会把它们一起删掉，且不可恢复。"
+            : "这是一个空课题，删除后随时可以重新新建。"))
+      ),
+      m("div", { className: "tv-modal-body" },
+        count ? m("div", { className: "tv-danger-box" },
+          m("label", { className: "tv-danger-opt" },
+            m("input", { type: "checkbox", checked: ack, disabled: busy,
+              onChange: (e) => setAck(e.target.checked) }),
+            m("span", null, "我确认连同这 ", m("b", null, count), " 条收藏一起删除")),
+          m("label", { className: "tv-danger-opt" },
+            m("input", { type: "checkbox", checked: withMedia, disabled: busy,
+              onChange: (e) => setWithMedia(e.target.checked) }),
+            m("span", null, "同时删除这些收藏的本地媒体文件（视频 / 图片 / 音频 / 转写）"))
+        ) : null,
+        isLast ? m("div", { className: "tv-modal-hint" }, "这是最后一个课题，删除后会自动重建一个空的默认课题。") : null,
+        errorMsg ? m("div", { className: "tv-field-error", style: { marginTop: 12 } }, errorMsg) : null
+      ),
+      m("div", { className: "tv-modal-foot" },
+        m("div", { className: "spacer" }),
+        m("button", { className: "tv-btn ghost", onClick: onClose, disabled: busy }, "取消"),
+        m("button", { className: "tv-btn danger", disabled: blocked || busy, onClick: submit },
+          m(Icon, { name: busy ? "refresh" : "trash", size: 15 }),
+          busy ? "删除中…" : (count ? "删除课题和 " + count + " 条收藏" : "删除课题"))
+      )
+    )
+  );
+}
+
+Object.assign(window, { Detail, EditModal, CollectModal, NewTopicModal, DownloadNotice,
+                        TopicEditModal, TopicDeleteModal });
