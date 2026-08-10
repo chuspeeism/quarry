@@ -65,6 +65,9 @@ vault/
 
 ## 环境变量
 
+本机固定的配置可以写进 `server/.env`（每行 `KEY=value`，已 gitignore），`start.sh` 会自动
+读进来；命令行上现给的环境变量优先级更高，不会被 `.env` 覆盖。
+
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` | 6002 | 监听端口 |
@@ -72,7 +75,7 @@ vault/
 | `QUARRY_DEFAULT_TOPIC_ID` | `inbox` | 默认课题 id |
 | `QUARRY_DEFAULT_TOPIC_NAME` | 未归类 | 默认课题名 |
 | `QUARRY_IMPORT_CONCURRENCY` | 2 | 并发导入闸门 |
-| `QUARRY_OPENCLI_PROFILE` | — | 采集专用的浏览器 profile 别名，见下节 |
+| `QUARRY_OPENCLI_PROFILE` | — | 采集专用的浏览器 profile 别名，见下节；没连上会警告并退回默认 |
 | `QUARRY_OPENCLI_WINDOW` | background | opencli 窗口模式，`background` / `foreground` |
 | `QUARRY_OPENCLI_SITE_SESSION` | persistent | 同平台复用同一标签页；置空则每条命令新开一个 |
 | `AI_ENGINE` | codex | `codex` / `ark` / `none` |
@@ -96,16 +99,28 @@ opencli 没有 headless 模式，抓取一定要在一个真实浏览器里开�
 
 剩下那一次窗口，唯一的根治办法是**别让它开在你正在用的浏览器里**：
 
-1. 在另一个浏览器（或另一个 Chrome profile）里装上 Browser Bridge 扩展，
-   在里面登好 B 站 / 小红书 / 抖音 / X
-2. `opencli profile list` 找到它的 contextId，`opencli profile rename <contextId> quarry`
-3. 启动时把采集指过去：
+1. 挑一个你平时不干活的浏览器（比如日常用 Dia，就拿 Google Chrome 来跑采集），
+   在里面装上 [Browser Bridge 扩展](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk)。
+   **必须走 Chrome 应用商店**：Chrome 137 起命令行 `--load-extension` 已经被禁掉，
+   本地解包目录加不进去了
+2. 在这个浏览器里登好 B 站 / 小红书 / 抖音 / X——采集用的就是它的登录态，
+   跟你日常浏览器的登录态是两套
+3. 起一次这个浏览器，然后给它起个别名：
 
 ```bash
-QUARRY_OPENCLI_PROFILE=quarry ./start.sh
+opencli profile list                       # 找到新出现的 contextId
+opencli profile rename <contextId> quarry  # 别名叫什么都行，跟下面对上即可
 ```
 
-4. macOS 上再把这个浏览器拖到另一个桌面（Space）：右键 Dock 图标 →「选项」→
+   别名映射存在 `~/.opencli/browser-profiles.json`，contextId 跨重启稳定，配一次就够。
+   `opencli profile use` 设的**默认** profile 不用动，其它工具照旧走原来的浏览器。
+
+4. 把 `QUARRY_OPENCLI_PROFILE=quarry` 写进 `server/.env`（已 gitignore，`start.sh`
+   会自动读），或者每次 `QUARRY_OPENCLI_PROFILE=quarry ./start.sh`。
+   启动时会校验这个 profile 是不是真连着：连上了打印
+   `[opencli] 采集走专用浏览器 profile：quarry`，没连上会警告并**退回默认浏览器**
+   ——配错别名不会让整个采集瘫掉，只是窗口又开回原来的地方
+5. macOS 上再把这个浏览器拖到另一个桌面（Space）：右键 Dock 图标 →「选项」→
    「此桌面」。之后采集窗口只会在那个桌面里开合，不再盖住你手上的活。
 
 ## 待采集队列：只存链接，稍后批量采集

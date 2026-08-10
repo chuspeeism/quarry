@@ -651,6 +651,32 @@ def detect_platform(url: str) -> dict:
     return {"platform": "unknown", "externalId": slugify_post_id(resolved), "canonicalUrl": resolved}
 
 
+def check_opencli_profile():
+    """启动时确认配置的采集 profile 真连着，没连上就退回默认。
+
+    配了个不存在的 profile 会让每一条 opencli 命令都失败——整个采集瘫掉，
+    比"窗口开错地方"严重得多。所以这里宁可退回默认并大声提示。
+    """
+    global OPENCLI_PROFILE
+    if not OPENCLI_PROFILE:
+        return
+    try:
+        p = subprocess.run([OPENCLI, "profile", "list"], capture_output=True, text=True,
+                           timeout=20, stdin=subprocess.DEVNULL)
+        connected = p.returncode == 0 and any(
+            OPENCLI_PROFILE in line.split() for line in p.stdout.splitlines())
+    except Exception:  # noqa: BLE001
+        connected = False
+    if connected:
+        print(f"[opencli] 采集走专用浏览器 profile：{OPENCLI_PROFILE}")
+        return
+    print(f"[opencli] 警告：profile「{OPENCLI_PROFILE}」没连上 Browser Bridge，"
+          "这次采集退回默认浏览器（窗口会开在你正在用的那个浏览器里）")
+    print("          在专用浏览器里装好扩展后，用 opencli profile list 找到 contextId，"
+          f"再 opencli profile rename <contextId> {OPENCLI_PROFILE}，然后重启本服务")
+    OPENCLI_PROFILE = ""
+
+
 def run_opencli_site(site: str, args, timeout=120):
     """所有 opencli 调用的唯一出口。
 
@@ -2162,6 +2188,7 @@ def main():
     _ensure_dirs()
     load_posts()
     load_queue()
+    check_opencli_profile()
     # 启动即校验新版前端入口与关键静态资源是否就位
     required = ["index.html", "tv-glass-theme.css", "tv-glass-app.jsx", "tv-data.js", "tv-api.js"]
     missing = [name for name in required if not os.path.exists(os.path.join(APP_ROOT, name))]
