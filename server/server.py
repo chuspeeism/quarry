@@ -53,42 +53,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
 
 import asr as asr_pipeline
+import keyframes
+import paths
+import projection
 
 # ---------------------------------------------------------------------------
 # 路径与配置
 # ---------------------------------------------------------------------------
-# 产品层：只放代码，不放任何采集到的内容。
-HERE = os.path.dirname(os.path.abspath(__file__))       # <repo>/server
-REPO_ROOT = os.path.dirname(HERE)                       # <repo>
-APP_ROOT = os.path.join(REPO_ROOT, "app")               # 前端静态资源
+# 产品层：只放代码，不放任何采集到的内容。路径解析见 paths.py。
+HERE = paths.HERE                                       # <repo>/server
+REPO_ROOT = paths.REPO_ROOT                             # <repo>
+APP_ROOT = paths.APP_ROOT                               # 前端静态资源
 INDEX_HTML = os.path.join(APP_ROOT, "index.html")
 
-
-def _main_repo_root() -> str:
-    """主仓库根目录。
-
-    git worktree 里 REPO_ROOT 指向 <repo>/.claude/worktrees/<name>/，按它取同级 ../vault
-    会算到 worktrees/vault —— 既不是真的内容层，还落在仓库目录里面。用 git 的 common-dir
-    反推主仓库位置：worktree 里返回主仓库的 <repo>/.git，普通仓库里返回相对的 .git，
-    两种都能 join 回 <repo>。非 git 仓库（下载 zip）或 git 不可用时退回 REPO_ROOT。
-    """
-    try:
-        proc = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--git-common-dir"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return REPO_ROOT
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return REPO_ROOT
-    root = os.path.dirname(os.path.abspath(os.path.join(REPO_ROOT, proc.stdout.strip())))
-    # 认领前先自证：主仓库里必须有这份代码本身，否则宁可用 REPO_ROOT。
-    return root if os.path.isfile(os.path.join(root, "server", "server.py")) else REPO_ROOT
-
-
 # 内容层：与产品层彻底分离，默认落在主仓库同级的 ../vault，可用 QUARRY_VAULT 指到任意位置。
-VAULT_ROOT = os.path.abspath(
-    os.environ.get("QUARRY_VAULT")
-    or os.path.join(os.path.dirname(_main_repo_root()), "vault")
-)
+VAULT_ROOT = paths.resolve_vault()
 DATA_DIR = os.path.join(VAULT_ROOT, "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
@@ -131,6 +110,8 @@ STAGE_PROGRESS = {
 }
 TRANSCRIPT_LIMIT = 16 * 1024
 RAW_META_LIMIT = 80
+# Agent 投影：写入 <vault>/agent/，供 quarry CLI 与 MCP 服务读取。置 0 关闭。
+AGENT_PROJECTION = (os.environ.get("QUARRY_AGENT_PROJECTION", "1") != "0")
 
 LOCK = threading.RLock()
 TOPICS: list = []     # 课题列表
@@ -530,6 +511,23 @@ def save_posts():
         json.dump({"version": DATA_VERSION, "count": len(POSTS), "topics": TOPICS, "posts": POSTS}, f,
                   ensure_ascii=False, indent=2)
     os.replace(tmp, POSTS_FILE)
+    sync_projection()
+
+
+def sync_projection(force: bool = False):
+    """把主数据投影成 <vault>/agent/ 下的 Agent 可读文件树。
+
+    挂在 save_posts() 后面：那是全部数据变更的唯一出口，挂在这里不会漏。投影是
+    派生数据，失败只记录不上抛——采集链路的可用性优先于派生数据的实时性，缺的
+    部分下次 `quarry reindex` 会补齐。
+    """
+    if not AGENT_PROJECTION:
+        return None
+    try:
+        return projection.sync(VAULT_ROOT, list(POSTS), list(TOPICS), force=force)
+    except Exception as e:  # noqa: BLE001
+        print(f"[agent] 投影失败：{e}")
+        return None
 
 
 def next_number(topic_id: str) -> int:
@@ -896,6 +894,7 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
             "transcriptMdPath": tr["transcriptMdPath"],
             "audioPath": tr["audioPath"],
             "transcriptSource": tr["transcriptSource"],
+            **extract_frames(media_path, warnings),
             "downloadStatus": download_status,
             "stats": stats,
             "rawMeta": compact_meta("x", item),
@@ -962,12 +961,29 @@ def transcribe_media(media_rel: str, title: str, source_link: str, warnings: lis
     if res["transcript"]:
         out["transcript"] = truncate_text(res["transcript"])
         out["transcriptSource"] = res["source"] or "asr"
+    elif res.get("noSpeech"):
+        # 已确认没有人声，与「还没转写」区分开，避免以后反复重试。
+        out["transcriptSource"] = "none"
     if res["srtPath"]:
         out["transcriptSrtPath"] = relpath(res["srtPath"])
     if res["mdPath"]:
         out["transcriptMdPath"] = relpath(res["mdPath"])
     if res["audioPath"]:
         out["audioPath"] = relpath(res["audioPath"])
+    return out
+
+
+def extract_frames(media_rel: str, warnings: list) -> dict:
+    """抽关键帧。视频本身没法进剪贴板也没法喂给纯文本消费方，静帧是它的可读替身。"""
+    out = {"framesDir": "", "frameCount": 0}
+    if not media_rel:
+        return out
+    res = keyframes.extract(os.path.join(VAULT_ROOT, media_rel))
+    if res["count"]:
+        out["framesDir"] = relpath(res["dir"])
+        out["frameCount"] = res["count"]
+    else:
+        warnings.extend(res["warnings"])
     return out
 
 
@@ -1145,6 +1161,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": transcript,
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": transcript_source,
+        **extract_frames(media_path, warnings),
         # 只下到封面不算 success：B 站帖必然是视频，正片缺了就是 partial
         "downloadStatus": video_download_status(media_path, image_path),
         "stats": stats,
@@ -1218,6 +1235,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
+        **extract_frames(media_path, warnings),
         # 笔记可能是图文也可能是视频，拿不到「应该有几个文件」，只能按下载命令是否报错分档：
         # 命令失败但落了几个文件 = partial，一个都没落 = failed
         "downloadStatus": (("success" if dl.returncode == 0 else "partial") if (image_path or media_path)
@@ -1451,6 +1469,7 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
+        **extract_frames(media_path, warnings),
         "downloadStatus": video_download_status(media_path, image_path),
         "stats": meta.get("stats") or {},
         "rawMeta": compact_meta("douyin", {"awemeId": aweme_id, "desc": meta["desc"][:200],
@@ -1607,6 +1626,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_bytes(build_app_html(), "text/html; charset=utf-8")
             except Exception as e:  # noqa: BLE001
                 self.send_error(500, str(e))
+            return
+        if path == "/api/meta":
+            # 前端「复制给 AI」要拼本机绝对路径，媒体路径在 posts.json 里是相对内容层
+            # 根的，所以得把根目录告诉前端。
+            with LOCK:
+                self._send_json({"vaultRoot": VAULT_ROOT, "version": DATA_VERSION,
+                                 "posts": len(POSTS), "topics": len(TOPICS)})
             return
         if path == "/api/topics":
             with LOCK:
@@ -1898,6 +1924,12 @@ def lan_ip() -> str:
 def main():
     _ensure_dirs()
     load_posts()
+    # 投影自检：索引行数与主数据条数对不上就全量重建（首启、格式升级、外部改动）
+    if AGENT_PROJECTION and projection.index_is_stale(VAULT_ROOT, len(POSTS)):
+        st = sync_projection(force=True)
+        if st:
+            print(f"[agent] 投影重建：{st['total']} 条 / 写入 {st['written']} / 删除 {st['deleted']}"
+                  f"{' / 失败 ' + str(st['errors']) if st['errors'] else ''}")
     # 启动即校验新版前端入口与关键静态资源是否就位
     required = ["index.html", "tv-glass-theme.css", "tv-glass-app.jsx", "tv-data.js", "tv-api.js"]
     missing = [name for name in required if not os.path.exists(os.path.join(APP_ROOT, name))]
