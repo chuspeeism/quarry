@@ -1,5 +1,5 @@
 /* global React, Icon, PLATFORMS, PLATFORM_ORDER, platformVarColor, PfChip, typeMeta, initials, relTime */
-const { createElement: hh } = React;
+const { createElement: hh, useState, useEffect, useRef } = React;
 
 function excerpt(post, n) {
   const s = (post.summary || post.body || post.originalText || "").replace(/\s+/g, " ").trim();
@@ -152,15 +152,91 @@ function Thumb({ post, mini }) {
   );
 }
 
+/* ---------------- 单条删除的公共部件 ---------------- */
+// 帖子在内容层里的本地文件数，和后端 _delete_post_files 清理的是同一批。
+// 用来给确认层报出「会连带删掉几个文件」，一个文件都没有时直接不显示这个选项。
+// 关键帧是一整个目录，按目录里的帧数计——一条视频往往 4–12 张，不计的话数字会明显偏小。
+function localFileCount(post) {
+  const files = [post.mediaPath, post.imagePath, post.audioPath,
+                 post.transcriptSrtPath, post.transcriptMdPath].filter(Boolean);
+  return files.length + (post.framesDir ? (post.frameCount || 1) : 0);
+}
+
+/* ---------------- 卡片内联删除确认（盖在卡片/行上，替代 window.confirm） ---------------- */
+// 删除直接改写 posts.json，没有回滚点，所以确认层里必须先勾「我确认」才解锁删除按钮；
+// 确认层会盖住卡片本身，因此把标题也列出来，避免点错卡还看不出删的是哪条。
+// 删除失败时不关确认层，原地显示后端返回的错误，用户可以重试或取消。
+function DeleteConfirm({ post, variant, onCancel, onDelete }) {
+  const fileCount = localFileCount(post);
+  const [ack, setAck] = useState(false);
+  const [withMedia, setWithMedia] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const cancelRef = useRef(null);
+  // 打开时把焦点放到「取消」上：既是安全默认项，也让 Esc 能落在确认层里被接住
+  useEffect(() => { cancelRef.current && cancelRef.current.focus(); }, []);
+
+  async function go(ev) {
+    ev.stopPropagation();
+    if (busy || !ack) return;
+    setBusy(true); setErr("");
+    try {
+      await onDelete(post, withMedia && fileCount > 0);
+    } catch (e) {
+      setBusy(false);
+      setErr((e && e.message) || "删除失败");
+    }
+  }
+
+  return hh("div", {
+      className: "tv-confirm" + (variant ? " " + variant : ""),
+      onClick: (e) => e.stopPropagation(),
+      onKeyDown: (e) => { e.stopPropagation(); if (e.key === "Escape" && !busy) onCancel(); },
+    },
+    hh("div", { className: "tv-confirm-msg" },
+      hh("span", { className: "ic" }, hh(Icon, { name: "trash", size: 14 })),
+      hh("b", null, "删除这条收藏？")),
+    hh("div", { className: "tv-confirm-title", title: post.title }, "「" + post.title + "」"),
+    hh("label", { className: "tv-confirm-opt strong" },
+      hh("input", { type: "checkbox", checked: ack, disabled: busy,
+        onChange: (e) => setAck(e.target.checked) }),
+      "我确认删除，不可恢复"),
+    fileCount ? hh("label", { className: "tv-confirm-opt" },
+      hh("input", { type: "checkbox", checked: withMedia, disabled: busy,
+        onChange: (e) => setWithMedia(e.target.checked) }),
+      "同时删除 " + fileCount + " 个本地文件") : null,
+    err ? hh("div", { className: "tv-confirm-err", title: err }, err) : null,
+    hh("div", { className: "tv-confirm-acts" },
+      hh("button", { ref: cancelRef, className: "tv-pcard-act", disabled: busy,
+        onClick: (e) => { e.stopPropagation(); onCancel(); } }, "取消"),
+      hh("button", { className: "tv-pcard-act danger solid", disabled: busy || !ack, onClick: go },
+        busy ? "删除中…" : "删除"))
+  );
+}
+
 /* ---------------- grid card ---------------- */
-function Card({ post, dense, onOpen }) {
+function Card({ post, dense, onOpen, onDelete }) {
   const pc = platformVarColor(post.platform);
-  const onKey = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } };
-  return hh("div", { className: "tv-card" + (dense ? " dense" : ""), onClick: onOpen, onKeyDown: onKey, role: "button", tabIndex: 0 },
+  const [confirming, setConfirming] = useState(false);
+  const onKey = (e) => {
+    if (confirming) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); }
+  };
+  return hh("div", {
+      className: "tv-card" + (dense ? " dense" : "") + (confirming ? " is-confirming" : ""),
+      onClick: confirming ? undefined : onOpen, onKeyDown: onKey, role: "button", tabIndex: 0,
+    },
     hh("div", { className: "tv-thumb-wrap" },
       hh(Thumb, { post }),
+      // 缺内容徽章挂左下、动作簇挂右下，各占一角互不遮挡
       hh(DownloadBadge, { post, variant: "card" }),
-      hh(SourceLink, { post })
+      hh("div", { className: "tv-card-acts" },
+        onDelete ? hh("button", {
+          className: "tv-card-del", title: "删除这条收藏", "aria-label": "删除这条收藏",
+          onClick: (e) => { e.stopPropagation(); setConfirming(true); },
+        }, hh(Icon, { name: "trash", size: 14 })) : null,
+        hh(SourceLink, { post })
+      )
     ),
     hh("div", { className: "tv-card-body" },
       hh("div", { className: "tv-card-author" },
@@ -178,15 +254,23 @@ function Card({ post, dense, onOpen }) {
           : hh("span", { className: "tv-kw" }, hh(Icon, { name: "doc", size: 12 }), "笔记"),
         hh("span", { className: "when" }, relTime(post.collectedAt))
       )
-    )
+    ),
+    confirming ? hh(DeleteConfirm, { post, onCancel: () => setConfirming(false), onDelete }) : null
   );
 }
 
 /* ---------------- list row ---------------- */
-function Row({ post, onOpen }) {
+function Row({ post, onOpen, onDelete }) {
   const p = PLATFORMS[post.platform] || PLATFORMS.x;
-  const onKey = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); } };
-  return hh("div", { className: "tv-row", onClick: onOpen, onKeyDown: onKey, role: "button", tabIndex: 0 },
+  const [confirming, setConfirming] = useState(false);
+  const onKey = (e) => {
+    if (confirming) return;
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpen(); }
+  };
+  return hh("div", {
+      className: "tv-row" + (confirming ? " is-confirming" : ""),
+      onClick: confirming ? undefined : onOpen, onKeyDown: onKey, role: "button", tabIndex: 0,
+    },
     hh(Thumb, { post, mini: true }),
     hh("div", { className: "tv-row-main" },
       hh("div", { className: "t" }, post.title),
@@ -202,8 +286,13 @@ function Row({ post, onOpen }) {
     hh("div", { className: "tv-row-side" },
       hh("span", { className: "pf" }, hh(PfChip, { id: post.platform }), p.label),
       hh("span", { className: "when" }, relTime(post.collectedAt)),
+      onDelete ? hh("button", {
+        className: "tv-row-del", title: "删除这条收藏", "aria-label": "删除这条收藏",
+        onClick: (e) => { e.stopPropagation(); setConfirming(true); },
+      }, hh(Icon, { name: "trash", size: 14 })) : null,
       hh(SourceLink, { post, variant: "row" })
-    )
+    ),
+    confirming ? hh(DeleteConfirm, { post, variant: "row", onCancel: () => setConfirming(false), onDelete }) : null
   );
 }
 
@@ -289,7 +378,7 @@ function PendingRow({ item, onRetry, onRemove }) {
 
 /* ---------------- sidebar ---------------- */
 function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, togglePlatform,
-                   typeFilter, toggleType, onNewTopic, total }) {
+                   typeFilter, toggleType, onNewTopic, onRenameTopic, onDeleteTopic, total }) {
   const platCounts = {};
   PLATFORM_ORDER.forEach((id) => { platCounts[id] = posts.filter((p) => p.platform === id).length; });
   const types = [
@@ -314,14 +403,31 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
           hh("h4", null, "课题"),
           hh("button", { className: "tv-add", onClick: onNewTopic, title: "新建课题" }, hh(Icon, { name: "plus", size: 14 }))
         ),
-        topics.map((t) => hh("button", {
-          key: t.id, type: "button",
-          className: "tv-topic" + (t.id === activeTopic ? " on" : ""),
-          onClick: () => setActiveTopic(t.id),
+        // 课题行 = 切换按钮 + 悬停才露出的重命名/删除（做成兄弟节点，避免按钮套按钮）
+        topics.map((t) => hh("div", {
+          key: t.id, className: "tv-topic-item" + (t.id === activeTopic ? " on" : ""),
         },
-          hh("span", { className: "tv-topic-dot" }),
-          hh("span", { className: "tv-topic-name" }, t.name),
-          hh("span", { className: "tv-topic-count" }, t.count)
+          hh("button", {
+            type: "button",
+            className: "tv-topic" + (t.id === activeTopic ? " on" : ""),
+            onClick: () => setActiveTopic(t.id),
+          },
+            hh("span", { className: "tv-topic-dot" }),
+            hh("span", { className: "tv-topic-name" }, t.name),
+            hh("span", { className: "tv-topic-count" }, t.count)
+          ),
+          (onRenameTopic || onDeleteTopic) ? hh("span", { className: "tv-topic-acts" },
+            onRenameTopic ? hh("button", {
+              type: "button", className: "tv-topic-act",
+              title: "重命名课题", "aria-label": "重命名课题「" + t.name + "」",
+              onClick: () => onRenameTopic(t),
+            }, hh(Icon, { name: "edit", size: 13 })) : null,
+            onDeleteTopic ? hh("button", {
+              type: "button", className: "tv-topic-act danger",
+              title: "删除课题", "aria-label": "删除课题「" + t.name + "」",
+              onClick: () => onDeleteTopic(t),
+            }, hh(Icon, { name: "trash", size: 13 })) : null
+          ) : null
         ))
       ),
       // platforms
@@ -368,4 +474,4 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
 }
 
 Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount,
-                        WarnIcon, DownloadBadge, downloadIssue });
+                        WarnIcon, DownloadBadge, downloadIssue, DeleteConfirm, localFileCount });

@@ -1,4 +1,4 @@
-/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, detectPlatform, Sidebar, Card, Row, PendingCard, PendingRow, Detail, CollectModal, NewTopicModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
+/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, detectPlatform, Sidebar, Card, Row, PendingCard, PendingRow, Detail, CollectModal, NewTopicModal, TopicEditModal, TopicDeleteModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
 const { createElement: e, useState, useEffect, useMemo, useRef, useCallback } = React;
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
@@ -70,6 +70,7 @@ function App() {
   const [openIndex, setOpenIndex] = useState(-1);
   const [lang, setLang] = useState("zh");
   const [modal, setModal] = useState(null); // "collect" | "newtopic"
+  const [topicAction, setTopicAction] = useState(null); // {kind:"rename"|"delete", topic}
   const [sortOpen, setSortOpen] = useState(false);
   const [toast, setToast] = useState(null);
   const searchRef = useRef(null);
@@ -190,9 +191,8 @@ function App() {
 
   // 当前课题下进行中的预览卡（置顶显示，不受筛选/排序影响）
   const pendingHere = pending.filter((it) => it.topic === activeTopic);
-  // Detail 里删除成功后：关详情 -> 刷新 -> toast
-  const onDeleted = async (post) => {
-    closeDetail();
+  // 删除成功后统一收尾：刷新列表 -> toast
+  const afterDeleted = async (post) => {
     const nm = ((post && post.title) || "").trim();
     const short = nm.length > 18 ? nm.slice(0, 18) + "…" : nm;
     try {
@@ -201,6 +201,13 @@ function App() {
     } catch (err) {
       showToast("已删除，但刷新失败，请手动刷新页面");
     }
+  };
+  // Detail 里删除成功后：关详情 -> 收尾
+  const onDeleted = async (post) => { closeDetail(); await afterDeleted(post); };
+  // 卡片/行上的删除：请求失败时把错误抛回卡片自己的确认层显示
+  const deletePost = async (post, withMedia) => {
+    await window.TVApi.deletePost(post.uid || post.id, withMedia);
+    await afterDeleted(post);
   };
   // Detail 里编辑保存后：刷新（详情保持打开，自动显示新内容）-> toast
   const onEdited = async () => {
@@ -222,6 +229,28 @@ function App() {
       showToast("课题已创建，但刷新失败，请手动刷新页面");
     }
   };
+  // 课题改名：id 不变，刷新后仍停在同一个课题上。
+  const onTopicRenamed = async (topic) => {
+    setTopicAction(null);
+    try {
+      await refresh(topic.id);
+      showToast("课题已改名为「" + topic.name + "」");
+    } catch (err) {
+      showToast("已保存，但刷新失败，请手动刷新页面");
+    }
+  };
+  // 课题删除：刷新时 activeTopic 已不存在，refresh 会自动回落到第一个课题。
+  const onTopicDeleted = async (topic, removedPosts) => {
+    setTopicAction(null);
+    try {
+      await refresh();
+      showToast(removedPosts
+        ? "已删除课题「" + topic.name + "」及其 " + removedPosts + " 条收藏"
+        : "已删除课题「" + topic.name + "」");
+    } catch (err) {
+      showToast("已删除，但刷新失败，请手动刷新页面");
+    }
+  };
 
   // 全局粘贴：不在输入框里、没开弹窗时，Cmd+V 粘贴链接直接开卡收藏到当前课题。
   useEffect(() => {
@@ -229,7 +258,7 @@ function App() {
       const el = ev.target;
       const tag = el && el.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (el && el.isContentEditable)) return;
-      if (modal) return; // CollectModal 自己有输入框
+      if (modal || topicAction) return; // 弹窗自己有输入框
       const text = (ev.clipboardData && ev.clipboardData.getData("text")) || "";
       const urls = text.split(/\s+/).map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
       if (!urls.length || !activeTopic) return;
@@ -238,7 +267,7 @@ function App() {
     };
     window.addEventListener("paste", onPaste);
     return () => window.removeEventListener("paste", onPaste);
-  }, [modal, activeTopic]);
+  }, [modal, topicAction, activeTopic]);
 
   // keyboard
   useEffect(() => {
@@ -253,13 +282,14 @@ function App() {
         if (ev.key === "ArrowLeft" || ev.key === "ArrowUp") { ev.preventDefault(); prev(); }
         return;
       }
+      if (topicAction) { if (ev.key === "Escape") setTopicAction(null); return; }
       if (modal) { if (ev.key === "Escape") setModal(null); return; }
       if (ev.key === "/") { ev.preventDefault(); searchRef.current && searchRef.current.focus(); }
       if (ev.key.toLowerCase() === "c") { ev.preventDefault(); setModal("collect"); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [openIndex, modal, visible.length]);
+  }, [openIndex, modal, topicAction, visible.length]);
 
   if (!loaded) {
     return e("div", { className: "tv-app tv-app-boot" },
@@ -274,7 +304,10 @@ function App() {
     e(Sidebar, {
       topics: topicsWithCount, posts: topicPosts, activeTopic, setActiveTopic,
       platformFilter, togglePlatform, typeFilter, toggleType,
-      onNewTopic: () => setModal("newtopic"), total: posts.length,
+      onNewTopic: () => setModal("newtopic"),
+      onRenameTopic: (t) => setTopicAction({ kind: "rename", topic: t }),
+      onDeleteTopic: (t) => setTopicAction({ kind: "delete", topic: t }),
+      total: posts.length,
     }),
     e("div", { className: "tv-main" },
       // top bar
@@ -339,10 +372,10 @@ function App() {
           : view === "grid"
             ? e("div", { className: "tv-grid" + (dense ? " dense" : "") },
                 pendingHere.map((it) => e(PendingCard, { key: it.key, item: it, dense, onRetry: retryPending, onRemove: removePending })),
-                visible.map((p, i) => e(Card, { key: p.id, post: p, dense, onOpen: () => openAt(i) })))
+                visible.map((p, i) => e(Card, { key: p.id, post: p, dense, onOpen: () => openAt(i), onDelete: deletePost })))
             : e("div", { className: "tv-list" },
                 pendingHere.map((it) => e(PendingRow, { key: it.key, item: it, onRetry: retryPending, onRemove: removePending })),
-                visible.map((p, i) => e(Row, { key: p.id, post: p, onOpen: () => openAt(i) })))
+                visible.map((p, i) => e(Row, { key: p.id, post: p, onOpen: () => openAt(i), onDelete: deletePost })))
       )
     ),
     // detail
@@ -356,6 +389,13 @@ function App() {
       onQueue: (links, topicId) => { setModal(null); collectLinks(links, topicId); },
     }) : null,
     modal === "newtopic" ? e(NewTopicModal, { onClose: () => setModal(null), onCreate: onCreateTopic }) : null,
+    topicAction && topicAction.kind === "rename" ? e(TopicEditModal, {
+      topic: topicAction.topic, onClose: () => setTopicAction(null), onSaved: onTopicRenamed,
+    }) : null,
+    topicAction && topicAction.kind === "delete" ? e(TopicDeleteModal, {
+      topic: topicAction.topic, isLast: topicsWithCount.length <= 1,
+      onClose: () => setTopicAction(null), onDeleted: onTopicDeleted,
+    }) : null,
     // toast
     toast ? e("div", { className: "tv-toast-wrap" }, e("div", { className: "tv-toast" },
       e("span", { className: "ti" }, e(Icon, { name: "check", size: 13 })), toast)) : null,

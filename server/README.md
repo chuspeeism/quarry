@@ -98,7 +98,11 @@ vault/
 
 - `GET /api/topics` → `{topics:[{id,name,description,postCount,...}]}`
 - `POST /api/topics` body `{name,id?}` → 创建课题
+- `PATCH /api/topics/<id>` body `{name?,description?}` → 课题改名/改描述（id 不变，帖子按 id 归属）
+- `DELETE /api/topics/<id>` → 删课题；非空必须加 `?force=1` 连帖子一起删，再加 `?media=1` 连本地媒体一起清理。删掉最后一个课题会自动重建默认课题
 - `GET /api/posts?topic=<id>` → 返回指定课题帖子
+- `PATCH /api/posts/<uid>` body `{title?,body?,summary?,keywords?,supplement?}` → 编辑帖子
+- `DELETE /api/posts/<uid>` → 删帖子；`?media=1` 连本地媒体文件一起删
 - `POST /api/add` body `{url,topic}` → `{taskId}`
 - `GET /api/task/<id>` → `{stage,progress,postId?,topic,warnings,message?}`
 - `GET /api/meta` → `{vaultRoot,version,posts,topics}`，前端「复制给 AI」拼本机绝对路径用
