@@ -1037,8 +1037,53 @@ def _finish_ai(post: dict, text: str, handle: str, platform: str, warnings: list
             save_posts()
 
 
+def _parse_ts_seconds(value) -> "float | None":
+    """把时间戳解析成秒，兼容三种形态；解析不出来返回 None。
+
+    - 纯数字 12.34
+    - opencli subtitle 的 "12.34s"
+    - opencli summary 的时钟串 "MM:SS" / "H:MM:SS"（小时位未补零）
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return None if value < 0 else float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            return None
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            return None
+        total = 0.0
+        for n in nums:
+            total = total * 60 + n
+    else:
+        try:
+            total = float(s.rstrip("sS").strip())
+        except ValueError:
+            return None
+    return None if total < 0 else total
+
+
+def _first_present(d: dict, *keys):
+    """取第一个存在且非 None 的键值（不能用 or，否则 0 秒会被当成缺失）。"""
+    for k in keys:
+        if d.get(k) is not None:
+            return d[k]
+    return None
+
+
 def _bili_rows_to_timeline(rows: list) -> str:
-    """B 站字幕行转 "[MM:SS] 文本" 时间轴格式；无时间信息时退回纯文本行。"""
+    """B 站字幕/AI 总结行转时间轴格式；无时间信息时退回纯文本行。
+
+    字幕有起止时间，输出 "[MM:SS → MM:SS] 文本"（与本地 ASR 输出一致）；
+    AI 总结只有单个 time，输出 "[MM:SS] 文本"，其首行整体总结无时间戳，走纯文本。
+    """
     lines = []
     for r in rows:
         if not isinstance(r, dict):
@@ -1046,11 +1091,15 @@ def _bili_rows_to_timeline(rows: list) -> str:
         content = str(r.get("content") or "").strip()
         if not content:
             continue
-        start = r.get("from") or r.get("start") or r.get("start_time")
-        if isinstance(start, (int, float)):
-            lines.append(f"[{asr_pipeline._fmt_clock(int(float(start) * 1000))}] {content}")
-        else:
+        start = _parse_ts_seconds(_first_present(r, "from", "start", "start_time", "time"))
+        end = _parse_ts_seconds(_first_present(r, "to", "end", "end_time"))
+        if start is None:
             lines.append(content)
+        elif end is None:
+            lines.append(f"[{asr_pipeline._fmt_clock(int(start * 1000))}] {content}")
+        else:
+            lines.append(f"[{asr_pipeline._fmt_clock(int(start * 1000))} → "
+                         f"{asr_pipeline._fmt_clock(int(end * 1000))}] {content}")
     return "\n".join(lines)
 
 
@@ -1126,7 +1175,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
             try:
                 rows = json.loads(summ.stdout)
                 if isinstance(rows, list):
-                    transcript = "\n".join(str(r.get("content") or "") for r in rows if isinstance(r, dict))
+                    transcript = _bili_rows_to_timeline(rows)
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"总结解析失败：{e}")
     if transcript:
