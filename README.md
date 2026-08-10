@@ -30,9 +30,11 @@ Quarry-选题矿场/
 ├── quarry/          ← 产品层：本仓库，只有代码
 │   ├── app/         前端（自包含 React + Babel standalone，无构建步骤）
 │   ├── server/      后端（Python 标准库 HTTP 服务）
+│   ├── bin/         quarry 命令行入口
 │   └── docs/        PRD 与设计文档
 └── vault/           ← 内容层：本地专属，不进 git
     ├── data/        posts.json + backups/ + media/
+    ├── agent/       Agent 可读投影（一帖一 md + 索引，由 data/ 派生）
     ├── outputs/     旧静态页产物
     └── archive/     历史归档
 ```
@@ -59,14 +61,46 @@ vault/data/media/
 
 `posts.json` 里记录的路径一律相对内容层根目录，所以整个 `vault/` 可以整体搬走、备份、换盘，不用改一行代码。
 
+## 把一条内容交给 AI
+
+详情页底部有「复制给 AI」：点一下，这条的标题、摘要、正文、平台原文、口播全文，
+外加视频/音频/字幕/关键帧的本机绝对路径，一起进剪贴板。粘到任何 AI 里都自足，
+不需要对方有读你磁盘的能力。按住 Shift 点则不带口播（长视频的转写能有几万字）。
+
+视频本身没法跟着剪贴板走，所以每条视频都抽了 4–12 张**关键帧**——纯文本消费方
+看不了视频，但能读这些静帧。
+
+## 让 AI Agent 检索这个库
+
+收藏进来的内容会同步投影到 `vault/agent/`：一帖一个 md（含不截断的口播全文），加一份 `index.jsonl` 轻量索引。Agent 可以直接 grep 和 read，也可以走命令：
+
+```bash
+export PATH="$PWD/bin:$PATH"
+quarry topics                       # 课题清单
+quarry search "提示词" --topic ae   # 全字段检索，含口播转写
+quarry show <uid> --full            # 单帖全文
+quarry pack --topic fable5          # 打包一个课题为单文件
+```
+
+命令直接读投影，不需要后端服务在跑。Claude 桌面端够不到磁盘，走 MCP：
+
+```bash
+claude mcp add quarry -s user -e QUARRY_VAULT=<内容层路径> -- python3 <仓库路径>/server/mcp_server.py
+codex  mcp add quarry    --env QUARRY_VAULT=<内容层路径> -- python3 <仓库路径>/server/mcp_server.py
+```
+
+完整设计与各客户端配置见 [docs/prd-04-agent-read-access.md](docs/prd-04-agent-read-access.md)。
+
 ## 文档
 
 | 文档 | 内容 |
 |------|------|
+| [AGENTS.md](AGENTS.md) | 给 Agent 的仓库须知：内容层在哪、怎么查 |
 | [server/README.md](server/README.md) | 后端接口、环境变量、内容层结构 |
 | [docs/prd-01-topic-collector.md](docs/prd-01-topic-collector.md) | 从单平台浏览器升级为课题帖子库 |
 | [docs/prd-02-multiplatform-import.md](docs/prd-02-multiplatform-import.md) | B 站 / 小红书 / 抖音链接导入设计 |
 | [docs/prd-03-v1-collection-hub.md](docs/prd-03-v1-collection-hub.md) | V1 全平台收集中台升级说明 |
+| [docs/prd-04-agent-read-access.md](docs/prd-04-agent-read-access.md) | Agent 读取能力：投影、CLI、MCP |
 
 ## 前端
 

@@ -485,6 +485,10 @@ button { color: inherit; background: none; border: 0; cursor: pointer; }
 .tv-foot-act:hover { background: var(--elev-2); color: var(--ink); border-color: var(--line-strong); }
 .tv-foot-act.danger:hover { color: #e0563f; border-color: color-mix(in oklab, #e0563f 40%, var(--line-2)); background: color-mix(in oklab, #e0563f 8%, var(--elev-2)); }
 .tv-foot-act svg { width: 15px; height: 15px; }
+/* 「复制给 AI」比其它页脚操作多一段文字，所以放开固定宽度 */
+.tv-copy-ai { width: auto; padding: 0 12px; gap: 7px; grid-auto-flow: column; font-size: 12px; font-weight: 500; }
+.tv-copy-ai.done { color: #2f8f5b; border-color: color-mix(in oklab, #2f8f5b 40%, var(--line-2)); background: color-mix(in oklab, #2f8f5b 10%, var(--elev-2)); }
+.tv-copy-ai.danger { color: #e0563f; border-color: color-mix(in oklab, #e0563f 40%, var(--line-2)); }
 
 /* -- 详情页：内联删除确认条（Frost 风格，替代 window.confirm）-- */
 .tv-del-confirm { padding: 12px 20px 14px; border-top: 1px solid color-mix(in oklab, #e0563f 26%, var(--line)); background: color-mix(in oklab, #e0563f 7%, var(--elev)); }

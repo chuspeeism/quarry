@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Quarry 内容层读取入口。把本目录加进 PATH 即可在任意位置调用。
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$HERE/../server/quarry_cli.py" "$@"

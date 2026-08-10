@@ -74,6 +74,8 @@ function DetailMedia({ post, pc, p, tm }) {
 const EXTRA_ICON_PATHS = {
   edit: "M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z",
   trash: "M4 6h16M9 6V4h6v2M6 6l1 14h10l1-14M10 10.5v5.5M14 10.5v5.5",
+  copy: "M9 9h10v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V9ZM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
+  check: "M5 12l4 4 10-10",
 };
 function ExtraIcon({ name, size = 15, style }) {
   return m("svg", {
@@ -139,7 +141,7 @@ function DownloadNotice({ post }) {
 }
 
 /* ===================== detail lightbox ===================== */
-function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, onDeleted, onEdited }) {
+function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, onDeleted, onEdited, topicName }) {
   const pc = platformVarColor(post.platform);
   const p = PLATFORMS[post.platform] || PLATFORMS.x;
   const tm = typeMeta(post.contentType);
@@ -159,11 +161,26 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
   const [delBusy, setDelBusy] = useState(false);
   const [delErr, setDelErr] = useState("");
   const [editing, setEditing] = useState(false);
+  const [copied, setCopied] = useState("");
 
   // 前后翻帖时重置删除确认条与编辑弹窗，避免误操作到另一条
   useEffect(() => {
     setConfirmDel(false); setDelMedia(true); setDelBusy(false); setDelErr(""); setEditing(false);
+    setCopied("");
   }, [uid]);
+
+  // 复制给 AI：把这一条的内容 + 本机文件路径写进剪贴板，粘到任何 AI 里都自足。
+  // 按住 Shift 点则不带口播转写（长视频的转写能有几千字）。
+  const doCopy = (ev) => {
+    if (!window.TVClip) { setCopied("err"); return; }
+    const text = window.TVClip.buildClipText(post, {
+      topicName: topicName || "",
+      withTranscript: !ev.shiftKey,
+    });
+    window.TVClip.writeClipboard(text)
+      .then(() => { setCopied("ok"); setTimeout(() => setCopied(""), 1800); })
+      .catch(() => { setCopied("err"); setTimeout(() => setCopied(""), 2600); });
+  };
 
   async function doDelete() {
     if (delBusy) return;
@@ -233,6 +250,13 @@ function Detail({ post, index, total, onPrev, onNext, onClose, lang, setLang, on
             )
           : m("div", { className: "tv-detail-foot" },
               m("span", { className: "when" }, post.published || "未记录时间"),
+              m("button", {
+                className: "tv-foot-act tv-copy-ai" + (copied === "ok" ? " done" : "") + (copied === "err" ? " danger" : ""),
+                title: copied === "err" ? "复制失败" : "复制这一条给 AI（按住 Shift 不带口播转写）",
+                onClick: doCopy,
+              },
+                m(ExtraIcon, { name: copied === "ok" ? "check" : "copy", size: 15 }),
+                m("span", null, copied === "ok" ? "已复制" : copied === "err" ? "失败" : "复制给 AI")),
               m("button", { className: "tv-foot-act", title: "编辑", onClick: () => setEditing(true) },
                 m(ExtraIcon, { name: "edit", size: 15 })),
               m("button", { className: "tv-foot-act danger", title: "删除",
