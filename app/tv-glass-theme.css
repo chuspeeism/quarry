@@ -560,6 +560,25 @@ button { color: inherit; background: none; border: 0; cursor: pointer; }
 .tv-prow .tv-batch-bar { margin-top: 6px; max-width: 340px; }
 .tv-prow .tv-row-side .when { font-variant-numeric: tabular-nums; }
 
+/* ---- download completeness（内容没抓全时的可见提示） ---- */
+/* --dl 是这套提示的色调开关：warn 琥珀 / bad 沿用全局报错红 / mute 灰蓝 */
+.tv-dlbadge { --dl: #cf8014; display: inline-flex; align-items: center; gap: 4px; flex: none; height: 20px; padding: 0 8px; border-radius: 999px; font-size: 10.5px; font-weight: 700; line-height: 1; white-space: nowrap;
+  color: color-mix(in oklab, var(--dl) 76%, #000); background: color-mix(in oklab, var(--dl) 16%, rgba(255,255,255,0.88)); border: 1px solid color-mix(in oklab, var(--dl) 34%, rgba(255,255,255,0.7)); }
+.tv-dlbadge.bad { --dl: #e0563f; }
+.tv-dlbadge.mute { --dl: #6e7f9c; }
+.tv-dlbadge.card { position: absolute; left: 10px; bottom: 9px; z-index: 2; height: 22px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); box-shadow: var(--shadow-soft); }
+.tv-dlbadge.row { height: 19px; padding: 0 7px; font-size: 10px; }
+
+.tv-dlnote { --dl: #cf8014; display: flex; align-items: flex-start; gap: 10px; margin: -6px 0 14px; padding: 10px 12px; border-radius: 10px;
+  color: color-mix(in oklab, var(--dl) 78%, #000); background: color-mix(in oklab, var(--dl) 10%, rgba(255,255,255,0.72)); border: 1px solid color-mix(in oklab, var(--dl) 30%, var(--line)); }
+.tv-dlnote.bad { --dl: #e0563f; }
+.tv-dlnote.mute { --dl: #6e7f9c; }
+.tv-dlnote .ico { flex: none; margin-top: 1px; }
+.tv-dlnote b { display: block; font-size: 12.5px; font-weight: 700; }
+.tv-dlnote p { margin: 3px 0 0; font-size: 12px; line-height: 1.55; color: var(--ink-2); }
+.tv-dlnote ul { margin: 7px 0 0; padding-left: 15px; }
+.tv-dlnote li { font-family: var(--font-mono); font-size: 10.5px; line-height: 1.5; color: var(--muted); word-break: break-word; }
+
 /* ---- engagement stats（收藏时点互动数据快照） ---- */
 .tv-stats { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
 .tv-stat { display: inline-flex; align-items: center; gap: 4px; font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }

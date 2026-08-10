@@ -50,6 +50,53 @@ function StatChips({ stats, max, className }) {
       hh(StatIcon, { name: s.key }), fmtCount(s.value))));
 }
 
+/* ---------------- 下载完整度（内容没存全时的可见提示）---------------- */
+// downloadStatus 非 success 就说明这条内容没抓全，最典型的是「视频本体下载失败、只剩封面」：
+// 卡片看起来跟正常图片帖一模一样，用户点开播放才发现没有正片。这里统一挂提示。
+const WARN_ICON_PATH = "M12 4.2 2.6 20.2h18.8L12 4.2ZM12 10.2v4.3M12 17.3h.01";
+
+function WarnIcon({ size = 11 }) {
+  return hh("svg", {
+    width: size, height: size, viewBox: "0 0 24 24",
+    fill: "none", stroke: "currentColor",
+    strokeWidth: 1.9, strokeLinecap: "round", strokeLinejoin: "round",
+  }, hh("path", { d: WARN_ICON_PATH }));
+}
+
+const DOWNLOAD_ISSUES = {
+  partial: { tone: "warn", label: "内容不完整", detail: "部分媒体没能下载下来，本地只存了一部分。" },
+  failed: { tone: "bad", label: "下载失败", detail: "媒体全部下载失败，本地没有留下文件。" },
+  skipped: { tone: "mute", label: "未存媒体", detail: "这条内容没有下载任何媒体文件。" },
+};
+
+// 返回 {tone,label,detail} 或 null（内容完整、不需要提示）
+function downloadIssue(post) {
+  const issue = DOWNLOAD_ISSUES[post.downloadStatus];
+  if (!issue) return null; // success 与未知状态都不提示
+  const isVideo = post.sourceType === "video";
+  // 纯文字帖本来就没有媒体，skipped 是正常状态，不算缺失
+  if (post.downloadStatus === "skipped" && !isVideo) return null;
+  if (isVideo && !post.hasVideo) {
+    return {
+      tone: post.downloadStatus === "failed" ? "bad" : "warn",
+      label: "缺视频本体",
+      detail: post.hasImage
+        ? "视频本体没下载成功，本地只有封面图，无法播放。"
+        : "视频本体没下载成功，本地没有留下可播放的文件。",
+    };
+  }
+  return issue;
+}
+
+function DownloadBadge({ post, variant }) {
+  const issue = downloadIssue(post);
+  if (!issue) return null;
+  return hh("span", {
+    className: "tv-dlbadge " + issue.tone + (variant ? " " + variant : ""),
+    title: issue.detail,
+  }, hh(WarnIcon, { size: variant === "row" ? 10 : 11 }), issue.label);
+}
+
 /* one-click open-original link (stops card click) */
 function SourceLink({ post, variant }) {
   if (!post.sourceLink) return null;
@@ -112,6 +159,7 @@ function Card({ post, dense, onOpen }) {
   return hh("div", { className: "tv-card" + (dense ? " dense" : ""), onClick: onOpen, onKeyDown: onKey, role: "button", tabIndex: 0 },
     hh("div", { className: "tv-thumb-wrap" },
       hh(Thumb, { post }),
+      hh(DownloadBadge, { post, variant: "card" }),
       hh(SourceLink, { post })
     ),
     hh("div", { className: "tv-card-body" },
@@ -143,6 +191,7 @@ function Row({ post, onOpen }) {
     hh("div", { className: "tv-row-main" },
       hh("div", { className: "t" }, post.title),
       hh("div", { className: "s" },
+        hh(DownloadBadge, { post, variant: "row" }),
         hh("span", null, post.author),
         hh("span", { className: "dot" }),
         hh("span", null, post.keywords.length ? `${post.keywords.length} 关键词` : "笔记"),
@@ -318,4 +367,5 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
   );
 }
 
-Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount });
+Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount,
+                        WarnIcon, DownloadBadge, downloadIssue });

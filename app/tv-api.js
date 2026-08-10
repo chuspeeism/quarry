@@ -73,6 +73,12 @@
     var imageUrl = abs(p.imagePath) || ((Array.isArray(p.remoteMedia) && p.remoteMedia[0]) || "");
     return Object.assign({}, p, {
       contentType: deriveType(p),
+      // 后端自己的内容类型（video/post/note）。contentType 被 deriveType 覆盖成 UI 用的
+      // 卡片类型后就丢了「这本来是个视频」的信息，而判断内容缺没缺全恰恰要靠它：
+      // 视频本体没下下来、只剩封面时，deriveType 会把它算成 image。
+      sourceType: p.contentType || "",
+      downloadStatus: p.downloadStatus || "",
+      warnings: Array.isArray(p.warnings) ? p.warnings : [],
       rawTitle: p.title || "",
       title: cleanTitle(p.title),
       keywords: Array.isArray(p.keywords) ? p.keywords : [],
