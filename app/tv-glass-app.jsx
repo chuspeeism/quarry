@@ -347,7 +347,8 @@ function App() {
     ),
     // detail
     openIndex >= 0 && visible[openIndex]
-      ? e(Detail, { post: visible[openIndex], index: openIndex, total: visible.length, lang, setLang, onPrev: prev, onNext: next, onClose: closeDetail, onDeleted, onEdited })
+      ? e(Detail, { post: visible[openIndex], index: openIndex, total: visible.length, lang, setLang, onPrev: prev, onNext: next, onClose: closeDetail, onDeleted, onEdited,
+                    topicName: (topics.find((t) => t.id === visible[openIndex].topic) || {}).name || "" })
       : null,
     // modals
     modal === "collect" ? e(CollectModal, {
