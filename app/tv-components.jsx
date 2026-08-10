@@ -318,4 +318,67 @@ function Sidebar({ topics, posts, activeTopic, setActiveTopic, platformFilter, t
   );
 }
 
-Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, StatChips, StatIcon, statEntries, fmtCount });
+/* ---------------- queue bar（待采集队列） ---------------- */
+// 「只存链接、稍后批量采集」的入口条：链接躺在队列里不碰浏览器，
+// 用户离开电脑时按「开始采集」，后端一条一条跑，全程只占一个标签页。
+function QueueBar({ queue, topics, onStart, onStop, onRetry, onRemove, onClear }) {
+  const [open, setOpen] = React.useState(false);
+  const items = queue.items || [];
+  if (!items.length) return null;
+
+  const draining = !!queue.draining;
+  const stopping = !!queue.stopping;
+  const waiting = items.filter((it) => it.status === "queued").length;
+  const failed = items.filter((it) => it.status === "error").length;
+  const running = items.find((it) => it.status === "running");
+  const topicName = (id) => (topics.find((t) => t.id === id) || {}).name || id;
+
+  const summary = draining
+    ? (stopping ? "正在收尾，跑完这条就停" : "采集中 · 还剩 " + waiting + " 条")
+    : failed
+      ? waiting + " 条待采集 · " + failed + " 条失败"
+      : waiting + " 条待采集";
+
+  return hh("div", { className: "tv-qbar" + (draining ? " is-live" : "") },
+    hh("div", { className: "tv-qbar-head" },
+      hh("span", { className: "ico" },
+        hh(Icon, { name: draining ? "refresh" : "clock", size: 15,
+          style: draining ? { animation: "spin 1.1s linear infinite" } : null })),
+      hh("div", { className: "txt" },
+        hh("b", null, summary),
+        hh("span", null, running ? shortLink(running.url) : "链接已存好，不会开网页；等你离开电脑再开始")
+      ),
+      draining
+        ? hh("button", { className: "tv-btn ghost sm", onClick: onStop, disabled: stopping },
+            hh(Icon, { name: "close", size: 14 }), stopping ? "停止中…" : "停止")
+        : hh("button", { className: "tv-btn primary sm", onClick: onStart, disabled: !waiting },
+            hh(Icon, { name: "play", size: 14, fill: true }), "开始采集"),
+      hh("button", { className: "tv-qbar-more", onClick: () => setOpen((o) => !o) },
+        open ? "收起" : "展开 " + items.length + " 条",
+        hh(Icon, { name: open ? "chevU" : "chevD", size: 13 }))
+    ),
+    open ? hh("div", { className: "tv-qbar-list" },
+      items.map((it) => hh("div", { key: it.id, className: "tv-qitem" + (it.status === "error" ? " is-error" : "") },
+        hh("span", { className: "st" },
+          it.status === "running"
+            ? hh(Icon, { name: "refresh", size: 13, style: { animation: "spin 1.1s linear infinite" } })
+            : it.status === "error"
+              ? hh(Icon, { name: "close", size: 13 })
+              : hh(Icon, { name: "clock", size: 13 })),
+        it.platform ? hh(PfChip, { id: it.platform }) : hh("span", { className: "tv-qitem-nopf" }, "?"),
+        hh("span", { className: "u", title: it.url }, shortLink(it.url)),
+        hh("span", { className: "tp" }, topicName(it.topic)),
+        it.status === "error" ? hh("span", { className: "er", title: it.message }, it.message || "采集失败") : null,
+        hh("span", { className: "sp" }),
+        it.status === "error"
+          ? hh("button", { className: "tv-pcard-act", onClick: () => onRetry(it.id) }, "重试") : null,
+        it.status !== "running"
+          ? hh("button", { className: "tv-pcard-act danger", onClick: () => onRemove(it.id) }, "移除") : null
+      )),
+      hh("div", { className: "tv-qbar-foot" },
+        hh("button", { className: "tv-clear", onClick: onClear }, "清空队列（不影响已入库的内容）"))
+    ) : null
+  );
+}
+
+Object.assign(window, { Thumb, Card, Row, Sidebar, PendingCard, PendingRow, QueueBar, StatChips, StatIcon, statEntries, fmtCount });

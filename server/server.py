@@ -93,6 +93,7 @@ VAULT_ROOT = os.path.abspath(
 DATA_DIR = os.path.join(VAULT_ROOT, "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 V1_BACKUP_FILE = os.path.join(BACKUP_DIR, "posts.v1.bak.json")
 V2_BACKUP_FILE = os.path.join(BACKUP_DIR, "posts.v2.bak.json")
@@ -145,6 +146,10 @@ LOCK = threading.RLock()
 TOPICS: list = []     # 课题列表
 POSTS: list = []      # 帖子列表（前端字段结构）
 TASKS: dict = {}      # taskId -> {stage, progress, message, postId, topic, warnings}
+# 待采集队列：粘链接时只落一条记录，不碰浏览器；等用户按「开始采集」再逐条跑。
+# 落盘在内容层（data/queue.json），关页面、重启服务都不会丢。
+QUEUE: list = []      # [{id, url, topic, platform, status, addedAt, taskId, message}]
+QUEUE_STATE = {"draining": False, "stopping": False, "currentId": ""}
 # 导入任务并发闸：多条链接同时粘贴时避免 opencli 浏览器桥/ASR 互相争抢
 IMPORT_SEM = threading.Semaphore(
     int(os.environ.get("QUARRY_IMPORT_CONCURRENCY") or os.environ.get("TV_IMPORT_CONCURRENCY", "2"))
@@ -668,9 +673,16 @@ def run_opencli_site(site: str, args, timeout=120):
     if OPENCLI_PROFILE:
         env["OPENCLI_PROFILE"] = OPENCLI_PROFILE
     with _site_lock(site):
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, stdin=subprocess.DEVNULL,
-                              cwd=VAULT_ROOT, env=env)
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout, stdin=subprocess.DEVNULL,
+                                  cwd=VAULT_ROOT, env=env)
+        except subprocess.TimeoutExpired:
+            # 超时按"这条命令失败"处理，不要炸掉整次导入：浏览器桥被别的活占住时，
+            # 一条字幕命令超时不该让已经抓到的正文和视频全部作废（队列跑无人值守，
+            # 这点尤其要紧）。调用点本来就有 returncode != 0 的降级分支。
+            return subprocess.CompletedProcess(
+                cmd, 124, "", f"opencli {site} {args[0] if args else ''} 超时（{timeout}s），已跳过")
 
 
 def run_opencli(args, timeout=120):
@@ -1531,6 +1543,150 @@ def _process_add_inner(task_id: str, url: str, topic_id: str):
         set_task(task_id, stage="error", topic=topic_id, message=str(e))
 
 
+# ---------------------------------------------------------------------------
+# 待采集队列：先存链接，等人不在电脑前了再批量跑
+# ---------------------------------------------------------------------------
+
+def guess_platform(url: str) -> str:
+    """只看域名猜平台，不发任何请求。
+
+    入队要快、要不打扰人，所以不能像 detect_platform() 那样为了短链去发 HEAD；
+    真正的平台识别留到出队真跑的时候做。
+    """
+    host = urlparse(url).netloc.lower()
+    if "bilibili.com" in host or "b23.tv" in host:
+        return "bilibili"
+    if "xiaohongshu.com" in host or "xhslink.com" in host:
+        return "xiaohongshu"
+    if "douyin.com" in host or "iesdouyin.com" in host:
+        return "douyin"
+    if "x.com" in host or "twitter.com" in host:
+        return "x"
+    return ""
+
+
+def load_queue():
+    global QUEUE
+    if not os.path.exists(QUEUE_FILE):
+        QUEUE = []
+        return
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"[queue] 读取失败，按空队列启动：{e}")
+        QUEUE = []
+        return
+    items = raw.get("items") if isinstance(raw, dict) else raw
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not it.get("url"):
+            continue
+        # 上次是跑到一半被关掉的，重启后回到待采集，让用户自己决定什么时候重来
+        status = it.get("status") if it.get("status") in ("queued", "error") else "queued"
+        out.append({
+            "id": str(it.get("id") or uuid.uuid4().hex[:12]),
+            "url": str(it["url"]),
+            "topic": str(it.get("topic") or ""),
+            "platform": str(it.get("platform") or guess_platform(str(it["url"]))),
+            "status": status,
+            "addedAt": int(it.get("addedAt") or now_ts()),
+            "taskId": "",
+            "message": str(it.get("message") or ""),
+        })
+    QUEUE = out
+    if QUEUE:
+        print(f"[queue] 待采集 {len(QUEUE)} 条（在界面上按「开始采集」才会跑）")
+
+
+def save_queue():
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "items": QUEUE}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+
+
+def enqueue_links(urls: list, topic_id: str) -> list:
+    """把链接压进待采集队列。同一课题下重复的链接直接跳过。"""
+    added = []
+    with LOCK:
+        seen = {(it["topic"], it["url"]) for it in QUEUE}
+        for url in urls:
+            if (topic_id, url) in seen:
+                continue
+            seen.add((topic_id, url))
+            item = {
+                "id": uuid.uuid4().hex[:12], "url": url, "topic": topic_id,
+                "platform": guess_platform(url), "status": "queued",
+                "addedAt": now_ts(), "taskId": "", "message": "",
+            }
+            QUEUE.append(item)
+            added.append(item)
+        if added:
+            save_queue()
+    return added
+
+
+def queue_snapshot() -> dict:
+    with LOCK:
+        return {
+            "items": [dict(it) for it in QUEUE],
+            "draining": QUEUE_STATE["draining"],
+            "stopping": QUEUE_STATE["stopping"],
+            "queued": sum(1 for it in QUEUE if it["status"] == "queued"),
+        }
+
+
+def _drain_queue():
+    """逐条把队列跑完。串行是故意的：一次只占一个浏览器标签页。"""
+    try:
+        while True:
+            with LOCK:
+                if QUEUE_STATE["stopping"]:
+                    break
+                item = next((it for it in QUEUE if it["status"] == "queued"), None)
+                if item is None:
+                    break
+                task_id = uuid.uuid4().hex[:12]
+                item["status"] = "running"
+                item["taskId"] = task_id
+                item["message"] = "已创建任务"
+                QUEUE_STATE["currentId"] = item["id"]
+                save_queue()
+            set_task(task_id, stage="pending", topic=item["topic"], message="已创建任务", warnings=[])
+            process_add(task_id, item["url"], item["topic"])
+            task = get_task(task_id)
+            with LOCK:
+                still = next((it for it in QUEUE if it["id"] == item["id"]), None)
+                if still is not None:
+                    if task.get("stage") == "error":
+                        # 失败的留在队列里显示原因，用户可以重试或删掉
+                        still["status"] = "error"
+                        still["message"] = task.get("message") or "采集失败"
+                        still["taskId"] = ""
+                    else:
+                        QUEUE.remove(still)
+                QUEUE_STATE["currentId"] = ""
+                save_queue()
+    finally:
+        with LOCK:
+            QUEUE_STATE["draining"] = False
+            QUEUE_STATE["stopping"] = False
+            QUEUE_STATE["currentId"] = ""
+
+
+def start_queue() -> dict:
+    with LOCK:
+        if QUEUE_STATE["draining"]:
+            return queue_snapshot()
+        if not any(it["status"] == "queued" for it in QUEUE):
+            return queue_snapshot()
+        QUEUE_STATE["draining"] = True
+        QUEUE_STATE["stopping"] = False
+    threading.Thread(target=_drain_queue, daemon=True).start()
+    return queue_snapshot()
+
+
 def build_app_html() -> bytes:
     # 新版 Quarry（Frost）前端是自包含的 React 应用，自己通过 /api/* 实时加载数据，
     # 不再需要运行时注入。旧版 vanilla 注入逻辑保留在 index.legacy.html 与 git 历史中。
@@ -1663,10 +1819,41 @@ class Handler(BaseHTTPRequestHandler):
             tid = path[len("/api/task/"):]
             self._send_json(get_task(tid))
             return
+        if path == "/api/queue":
+            self._send_json(queue_snapshot())
+            return
         self._serve_static(path)
 
     def do_POST(self):
         path = urlparse(self.path).path
+
+        # --- 待采集队列 ---
+        if path == "/api/queue/start":
+            self._send_json(start_queue())
+            return
+        if path == "/api/queue/stop":
+            with LOCK:
+                if QUEUE_STATE["draining"]:
+                    QUEUE_STATE["stopping"] = True
+            self._send_json(queue_snapshot())
+            return
+        m = re.fullmatch(r"/api/queue/([^/]+)/retry", path)
+        if m:
+            qid = unquote(m.group(1))
+            with LOCK:
+                item = next((it for it in QUEUE if it["id"] == qid), None)
+                if not item:
+                    self._send_json({"error": f"队列里没有这一条：{qid}"}, 404)
+                    return
+                if item["status"] == "running":
+                    self._send_json({"error": "这一条正在采集中"}, 400)
+                    return
+                item["status"] = "queued"
+                item["message"] = ""
+                save_queue()
+            self._send_json(queue_snapshot())
+            return
+
         if path == "/api/topics":
             try:
                 payload = self._read_json()
@@ -1767,6 +1954,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "请提供有效的平台内容链接"}, 400)
             return
 
+        # defer=true：只把链接压进待采集队列，一个浏览器页都不开
+        if payload.get("defer"):
+            added = enqueue_links(url_list, topic_id)
+            snap = queue_snapshot()
+            snap["added"] = added
+            snap["skipped"] = len(url_list) - len(added)
+            self._send_json(snap)
+            return
+
         if len(url_list) == 1 and not isinstance(raw_urls, list):
             # 单条：保持原有契约（预检平台，直接返回 taskId）
             url = url_list[0]
@@ -1822,6 +2018,35 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        # --- 待采集队列：清空 / 删单条（正在跑的那条不动）---
+        if path == "/api/queue":
+            with LOCK:
+                kept = [it for it in QUEUE if it["status"] == "running"]
+                removed = len(QUEUE) - len(kept)
+                QUEUE[:] = kept
+                save_queue()
+            snap = queue_snapshot()
+            snap["removed"] = removed
+            self._send_json(snap)
+            return
+        if path.startswith("/api/queue/"):
+            qid = unquote(path[len("/api/queue/"):])
+            with LOCK:
+                item = next((it for it in QUEUE if it["id"] == qid), None)
+                if not item:
+                    self._send_json({"error": f"队列里没有这一条：{qid}"}, 404)
+                    return
+                if item["status"] == "running":
+                    self._send_json({"error": "这一条正在采集中，先停止队列再删"}, 400)
+                    return
+                QUEUE.remove(item)
+                save_queue()
+            snap = queue_snapshot()
+            snap["removed"] = 1
+            self._send_json(snap)
+            return
+
         if path.startswith("/api/posts/"):
             uid = unquote(path[len("/api/posts/"):])
             with_media = (query.get("media") or ["0"])[0] in ("1", "true", "yes")
@@ -1936,6 +2161,7 @@ def lan_ip() -> str:
 def main():
     _ensure_dirs()
     load_posts()
+    load_queue()
     # 启动即校验新版前端入口与关键静态资源是否就位
     required = ["index.html", "tv-glass-theme.css", "tv-glass-app.jsx", "tv-data.js", "tv-api.js"]
     missing = [name for name in required if not os.path.exists(os.path.join(APP_ROOT, name))]

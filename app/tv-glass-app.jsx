@@ -1,4 +1,4 @@
-/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, detectPlatform, Sidebar, Card, Row, PendingCard, PendingRow, Detail, CollectModal, NewTopicModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
+/* global React, ReactDOM, Icon, PLATFORMS, PLATFORM_ORDER, detectPlatform, Sidebar, Card, Row, PendingCard, PendingRow, QueueBar, Detail, CollectModal, NewTopicModal, useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio */
 const { createElement: e, useState, useEffect, useMemo, useRef, useCallback } = React;
 
 const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
@@ -188,6 +188,67 @@ function App() {
     runPendingTask(key, it.url, it.topic, null);
   };
 
+  // ===== 待采集队列：只存链接不抓取，等用户按「开始采集」后端才逐条跑 =====
+  // 队列存在后端（内容层 data/queue.json），关页面、重启服务都还在。
+  const [queue, setQueue] = useState({ items: [], draining: false, stopping: false, queued: 0 });
+  const queueSize = queue.items.length;
+  const wasDraining = useRef(false);
+
+  const pullQueue = useCallback(async () => {
+    if (!window.TVApi.getQueue) return;
+    try { setQueue(await window.TVApi.getQueue()); } catch (err) { /* 离线时静默 */ }
+  }, []);
+
+  useEffect(() => { pullQueue(); }, [pullQueue]);
+
+  // 队列在后端，别的标签页/别的窗口也能往里加，所以一直轮询；
+  // 只是跑着的时候勤一点，闲着的时候慢一点。
+  useEffect(() => {
+    const id = setInterval(pullQueue, queue.draining ? 2000 : 15000);
+    return () => clearInterval(id);
+  }, [queue.draining, pullQueue]);
+
+  // 采集过程中队列条目减少 = 有内容入库了，顺手把列表刷新出来
+  const prevSize = useRef(queueSize);
+  useEffect(() => {
+    if (queue.draining && queueSize < prevSize.current) refresh().catch(() => {});
+    prevSize.current = queueSize;
+  }, [queueSize, queue.draining]);
+
+  // 整批跑完的那一下给个提示，人不在电脑前回来也知道结果
+  useEffect(() => {
+    if (wasDraining.current && !queue.draining) {
+      const failed = queue.items.filter((it) => it.status === "error").length;
+      showToast(failed ? "队列跑完了，有 " + failed + " 条失败，展开队列可重试" : "待采集队列已全部收完");
+      refresh().catch(() => {});
+    }
+    wasDraining.current = queue.draining;
+  }, [queue.draining]);
+
+  const deferLinks = async (urls, topicId) => {
+    try {
+      const snap = await window.TVApi.queueLinks(urls, topicId);
+      setQueue(snap);
+      const n = (snap.added || []).length;
+      const skipped = snap.skipped || 0;
+      showToast(n
+        ? "已加入队列 " + n + " 条" + (skipped ? "（跳过 " + skipped + " 条重复）" : "") + "，按「开始采集」再跑"
+        : "这些链接已经在队列里了");
+    } catch (err) {
+      showToast((err && err.message) || "加入队列失败");
+    }
+  };
+
+  const queueAction = (fn, failMsg) => async (arg) => {
+    try { setQueue(await fn(arg)); }
+    catch (err) { showToast((err && err.message) || failMsg); }
+  };
+  const startQueue = queueAction(() => window.TVApi.startQueue(), "启动失败");
+  const stopQueue = queueAction(() => window.TVApi.stopQueue(), "停止失败");
+  const retryQueued = queueAction((id) => window.TVApi.retryQueued(id), "重试失败");
+  const removeQueued = queueAction((id) => window.TVApi.removeQueued(id), "移除失败");
+  const clearQueue = queueAction(() => window.TVApi.clearQueue(), "清空失败");
+
   // 当前课题下进行中的预览卡（置顶显示，不受筛选/排序影响）
   const pendingHere = pending.filter((it) => it.topic === activeTopic);
   // Detail 里删除成功后：关详情 -> 刷新 -> toast
@@ -332,6 +393,12 @@ function App() {
           e("button", { className: "tv-fclose", onClick: () => setQuery("") }, e(Icon, { name: "close", size: 11 }))) : null,
         e("button", { className: "tv-clear", onClick: clearFilters }, "清除全部")
       ) : null,
+      // 待采集队列（跨课题，队列空时整条不渲染）
+      e(QueueBar, {
+        queue, topics: topicsWithCount,
+        onStart: startQueue, onStop: stopQueue,
+        onRetry: retryQueued, onRemove: removeQueued, onClear: clearQueue,
+      }),
       // board（收藏中的预览卡片固定置顶，不受筛选/排序影响）
       e("div", { className: "tv-board tv-scroll" },
         visible.length === 0 && pendingHere.length === 0
@@ -353,6 +420,7 @@ function App() {
     modal === "collect" ? e(CollectModal, {
       topics: topicsWithCount, defaultTopic: activeTopic, onClose: () => setModal(null),
       onQueue: (links, topicId) => { setModal(null); collectLinks(links, topicId); },
+      onDefer: (links, topicId) => { setModal(null); deferLinks(links, topicId); },
     }) : null,
     modal === "newtopic" ? e(NewTopicModal, { onClose: () => setModal(null), onCreate: onCreateTopic }) : null,
     // toast

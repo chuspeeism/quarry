@@ -108,13 +108,38 @@ QUARRY_OPENCLI_PROFILE=quarry ./start.sh
 4. macOS 上再把这个浏览器拖到另一个桌面（Space）：右键 Dock 图标 →「选项」→
    「此桌面」。之后采集窗口只会在那个桌面里开合，不再盖住你手上的活。
 
+## 待采集队列：只存链接，稍后批量采集
+
+上面那套是"少开、开在别处"，队列是另一条路——**这段时间干脆一个网页都不开**。
+
+收藏弹窗里有两个按钮，每次自己选，没有隐藏开关：
+
+| 按钮 | 行为 |
+|------|------|
+| 立即收藏 | 马上抓，进度显示在列表顶部的预览卡片里（原有行为，没变） |
+| 加入队列 | 只把链接记到队列里，零网页、零抓取；等你按「开始采集」才跑 |
+
+队列落盘在内容层 `data/queue.json`，**关页面、重启服务都还在**。上次跑到一半被关掉的
+那条会退回"待采集"，由你决定什么时候重来。
+
+跑起来之后是**一条一条串行**跑的：整批采集全程只占一个浏览器标签页。成功的自动出队，
+失败的留在队列里显示原因，可以单独重试或移除。「停止」是跑完当前这条就停，不会把
+正在处理的内容截断成半成品。
+
+界面上队列条是跨课题的（每条带课题标签），队列空时整条不显示。
+
 ## 接口
 
 - `GET /api/topics` → `{topics:[{id,name,description,postCount,...}]}`
 - `POST /api/topics` body `{name,id?}` → 创建课题
 - `GET /api/posts?topic=<id>` → 返回指定课题帖子
 - `POST /api/add` body `{url,topic}` → `{taskId}`
+- `POST /api/add` body `{urls:[...],topic,defer:true}` → 只入队，返回队列快照
 - `GET /api/task/<id>` → `{stage,progress,postId?,topic,warnings,message?}`
+- `GET /api/queue` → `{items,draining,stopping,queued}`
+- `POST /api/queue/start` / `POST /api/queue/stop` → 开始 / 收尾停止
+- `POST /api/queue/<id>/retry` → 失败的那条重新排队
+- `DELETE /api/queue/<id>` / `DELETE /api/queue` → 删单条 / 清空（正在跑的那条不动）
 
 ## 转写管线
 

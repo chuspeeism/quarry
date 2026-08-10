@@ -13,6 +13,7 @@ const P = {
   chevL: "M15 6l-6 6 6 6",
   chevR: "M9 6l6 6-6 6",
   chevD: "M6 9l6 6 6-6",
+  chevU: "M6 15l6-6 6 6",
   check: "M5 12l4 4 10-10",
   play: "M8 5v14l11-7z",
   doc: "M7 3h7l5 5v13a0 0 0 0 1 0 0H7zM14 3v5h5M9 13h6M9 17h6",

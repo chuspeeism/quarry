@@ -7,6 +7,9 @@
  *   - addLink(url, topic)  收藏链接，返回 taskId -> POST /api/add
  *   - addLinks(urls, t)    批量收藏，返回 tasks  -> POST /api/add {urls:[...]}
  *   - pollTask(id, onTick) 轮询抓取/AI 进度    -> GET  /api/task/<id>
+ *   - queueLinks(urls, t)  只入队不抓取        -> POST /api/add {defer:true}
+ *   - getQueue()/startQueue()/stopQueue()      -> /api/queue[/start|/stop]
+ *   - retryQueued(id)/removeQueued(id)/clearQueue()
  *   - deletePost(uid, m)   删除帖子(可连媒体)   -> DELETE /api/posts/<uid>?media=1
  *   - updatePost(uid, f)   编辑帖子字段        -> PATCH /api/posts/<uid>
  *
@@ -127,6 +130,18 @@
     return data.tasks;
   }
 
+  // ===== 待采集队列：只存链接，不开浏览器，等按「开始采集」再逐条跑 =====
+  // 后端返回的快照统一是 {items, draining, stopping, queued}
+  async function queueLinks(urls, topic) {
+    return jpost("/api/add", { urls: urls, topic: topic, defer: true });
+  }
+  async function getQueue() { return jget("/api/queue"); }
+  async function startQueue() { return jpost("/api/queue/start"); }
+  async function stopQueue() { return jpost("/api/queue/stop"); }
+  async function retryQueued(id) { return jpost("/api/queue/" + encodeURIComponent(id) + "/retry"); }
+  async function removeQueued(id) { return jsend("DELETE", "/api/queue/" + encodeURIComponent(id)); }
+  async function clearQueue() { return jsend("DELETE", "/api/queue"); }
+
   // 删除帖子：withMedia 为真时连本地媒体文件一起删（?media=1）
   async function deletePost(uid, withMedia) {
     var path = "/api/posts/" + encodeURIComponent(uid) + (withMedia ? "?media=1" : "");
@@ -165,5 +180,12 @@
     updatePost: updatePost,
     adaptPost: adaptPost,
     abs: abs,
+    queueLinks: queueLinks,
+    getQueue: getQueue,
+    startQueue: startQueue,
+    stopQueue: stopQueue,
+    retryQueued: retryQueued,
+    removeQueued: removeQueued,
+    clearQueue: clearQueue,
   };
 })();
