@@ -14,7 +14,7 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
   GET    /api/topics          列出课题 {topics:[...]}
   POST   /api/topics          创建课题 {name,id?}
   PATCH  /api/topics/<id>     编辑课题 {name?,description?}
-  DELETE /api/topics/<id>     删除课题（非空需 ?force=1）
+  DELETE /api/topics/<id>     删除课题（非空需 ?force=1；?media=1 连本地媒体一起删）
   GET    /api/posts           列出帖子 {posts:[...]}，支持 ?topic=<id>
   PATCH  /api/posts/<uid>     编辑帖子 {title?,body?,summary?,keywords?,supplement?}
   DELETE /api/posts/<uid>     删除帖子（?media=1 连本地媒体一起删）
@@ -54,42 +54,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
 
 import asr as asr_pipeline
+import keyframes
+import paths
+import projection
 
 # ---------------------------------------------------------------------------
 # 路径与配置
 # ---------------------------------------------------------------------------
-# 产品层：只放代码，不放任何采集到的内容。
-HERE = os.path.dirname(os.path.abspath(__file__))       # <repo>/server
-REPO_ROOT = os.path.dirname(HERE)                       # <repo>
-APP_ROOT = os.path.join(REPO_ROOT, "app")               # 前端静态资源
+# 产品层：只放代码，不放任何采集到的内容。路径解析见 paths.py。
+HERE = paths.HERE                                       # <repo>/server
+REPO_ROOT = paths.REPO_ROOT                             # <repo>
+APP_ROOT = paths.APP_ROOT                               # 前端静态资源
 INDEX_HTML = os.path.join(APP_ROOT, "index.html")
 
-
-def _main_repo_root() -> str:
-    """主仓库根目录。
-
-    git worktree 里 REPO_ROOT 指向 <repo>/.claude/worktrees/<name>/，按它取同级 ../vault
-    会算到 worktrees/vault —— 既不是真的内容层，还落在仓库目录里面。用 git 的 common-dir
-    反推主仓库位置：worktree 里返回主仓库的 <repo>/.git，普通仓库里返回相对的 .git，
-    两种都能 join 回 <repo>。非 git 仓库（下载 zip）或 git 不可用时退回 REPO_ROOT。
-    """
-    try:
-        proc = subprocess.run(["git", "-C", REPO_ROOT, "rev-parse", "--git-common-dir"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return REPO_ROOT
-    if proc.returncode != 0 or not proc.stdout.strip():
-        return REPO_ROOT
-    root = os.path.dirname(os.path.abspath(os.path.join(REPO_ROOT, proc.stdout.strip())))
-    # 认领前先自证：主仓库里必须有这份代码本身，否则宁可用 REPO_ROOT。
-    return root if os.path.isfile(os.path.join(root, "server", "server.py")) else REPO_ROOT
-
-
 # 内容层：与产品层彻底分离，默认落在主仓库同级的 ../vault，可用 QUARRY_VAULT 指到任意位置。
-VAULT_ROOT = os.path.abspath(
-    os.environ.get("QUARRY_VAULT")
-    or os.path.join(os.path.dirname(_main_repo_root()), "vault")
-)
+VAULT_ROOT = paths.resolve_vault()
 DATA_DIR = os.path.join(VAULT_ROOT, "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
@@ -141,6 +120,8 @@ STAGE_PROGRESS = {
 }
 TRANSCRIPT_LIMIT = 16 * 1024
 RAW_META_LIMIT = 80
+# Agent 投影：写入 <vault>/agent/，供 quarry CLI 与 MCP 服务读取。置 0 关闭。
+AGENT_PROJECTION = (os.environ.get("QUARRY_AGENT_PROJECTION", "1") != "0")
 
 LOCK = threading.RLock()
 TOPICS: list = []     # 课题列表
@@ -244,6 +225,31 @@ def make_platform_uid(topic_id: str, platform: str, external_id: str) -> str:
     return f"{topic_id}__{platform}__{slugify_post_id(external_id)}"
 
 
+def video_download_status(media_path: str, image_path: str, attempted: bool = True) -> str:
+    """视频类内容的下载完整度：以「视频本体」为准，封面不顶数。
+
+    封面下载成功、视频本体失败时必须是 partial —— 报 success 的话前端看不出
+    这条内容缺了正片，用户要等到点开播放才发现。
+    """
+    if media_path:
+        return "success"
+    if not attempted:
+        return "skipped"
+    return "partial" if image_path else "failed"
+
+
+def derive_download_status(post: dict) -> str:
+    """没有显式状态时（种子数据/历史字段缺失）按已存文件推断。
+
+    视频类走 video_download_status；其它类型有任意媒体就算完整，都没有算没下过。
+    """
+    media = str(post.get("mediaPath") or "")
+    image = str(post.get("imagePath") or "")
+    if str(post.get("contentType") or "") == "video":
+        return video_download_status(media, image, attempted=bool(media or image))
+    return "success" if (media or image) else "skipped"
+
+
 def normalize_post(post: dict, topic_id: str = DEFAULT_TOPIC_ID) -> dict:
     p = dict(post)
     p["topic"] = str(p.get("topic") or topic_id)
@@ -251,7 +257,7 @@ def normalize_post(post: dict, topic_id: str = DEFAULT_TOPIC_ID) -> dict:
     p["platform"] = str(p.get("platform") or "x")
     p["externalId"] = str(p.get("externalId") or p.get("tweetId") or p.get("uid") or p.get("id") or "")
     p["contentType"] = str(p.get("contentType") or ("post" if p["platform"] == "x" else "video"))
-    p["downloadStatus"] = str(p.get("downloadStatus") or ("success" if p.get("mediaPath") or p.get("imagePath") else "skipped"))
+    p["downloadStatus"] = str(p.get("downloadStatus") or derive_download_status(p))
     p["transcript"] = truncate_text(str(p.get("transcript") or ""))
     for key in ("transcriptSrtPath", "transcriptMdPath", "audioPath", "transcriptSource"):
         p[key] = str(p.get(key) or "")
@@ -536,6 +542,23 @@ def save_posts():
         json.dump({"version": DATA_VERSION, "count": len(POSTS), "topics": TOPICS, "posts": POSTS}, f,
                   ensure_ascii=False, indent=2)
     os.replace(tmp, POSTS_FILE)
+    sync_projection()
+
+
+def sync_projection(force: bool = False):
+    """把主数据投影成 <vault>/agent/ 下的 Agent 可读文件树。
+
+    挂在 save_posts() 后面：那是全部数据变更的唯一出口，挂在这里不会漏。投影是
+    派生数据，失败只记录不上抛——采集链路的可用性优先于派生数据的实时性，缺的
+    部分下次 `quarry reindex` 会补齐。
+    """
+    if not AGENT_PROJECTION:
+        return None
+    try:
+        return projection.sync(VAULT_ROOT, list(POSTS), list(TOPICS), force=force)
+    except Exception as e:  # noqa: BLE001
+        print(f"[agent] 投影失败：{e}")
+        return None
 
 
 def next_number(topic_id: str) -> int:
@@ -938,6 +961,11 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
                 remote.append(u)
         if media_urls and not media_path and not image_path:
             warnings.append("全部媒体下载失败，已保留远程链接。")
+        # 只要有媒体没落地就不算完整：一条都没下来是 failed，下了一部分是 partial
+        if remote:
+            download_status = "partial" if (media_path or image_path) else "failed"
+        else:
+            download_status = "success" if (media_path or image_path) else "skipped"
 
         # 2.5) 视频口播转写（四件套：mp4 + m4a + srt + 口播词.md）
         title_seed = (article.get("title") if article else "") or f"@{username} 的帖子"
@@ -983,7 +1011,8 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
             "transcriptMdPath": tr["transcriptMdPath"],
             "audioPath": tr["audioPath"],
             "transcriptSource": tr["transcriptSource"],
-            "downloadStatus": "success" if media_path or image_path else ("partial" if remote else "skipped"),
+            **extract_frames(media_path, warnings),
+            "downloadStatus": download_status,
             "stats": stats,
             "rawMeta": compact_meta("x", item),
             "aiStatus": "pending",
@@ -1049,12 +1078,29 @@ def transcribe_media(media_rel: str, title: str, source_link: str, warnings: lis
     if res["transcript"]:
         out["transcript"] = truncate_text(res["transcript"])
         out["transcriptSource"] = res["source"] or "asr"
+    elif res.get("noSpeech"):
+        # 已确认没有人声，与「还没转写」区分开，避免以后反复重试。
+        out["transcriptSource"] = "none"
     if res["srtPath"]:
         out["transcriptSrtPath"] = relpath(res["srtPath"])
     if res["mdPath"]:
         out["transcriptMdPath"] = relpath(res["mdPath"])
     if res["audioPath"]:
         out["audioPath"] = relpath(res["audioPath"])
+    return out
+
+
+def extract_frames(media_rel: str, warnings: list) -> dict:
+    """抽关键帧。视频本身没法进剪贴板也没法喂给纯文本消费方，静帧是它的可读替身。"""
+    out = {"framesDir": "", "frameCount": 0}
+    if not media_rel:
+        return out
+    res = keyframes.extract(os.path.join(VAULT_ROOT, media_rel))
+    if res["count"]:
+        out["framesDir"] = relpath(res["dir"])
+        out["frameCount"] = res["count"]
+    else:
+        warnings.extend(res["warnings"])
     return out
 
 
@@ -1136,8 +1182,53 @@ def fetch_bilibili_view(bvid: str) -> dict:
     return meta
 
 
+def _parse_ts_seconds(value) -> "float | None":
+    """把时间戳解析成秒，兼容三种形态；解析不出来返回 None。
+
+    - 纯数字 12.34
+    - opencli subtitle 的 "12.34s"
+    - opencli summary 的时钟串 "MM:SS" / "H:MM:SS"（小时位未补零）
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return None if value < 0 else float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) > 3:
+            return None
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            return None
+        total = 0.0
+        for n in nums:
+            total = total * 60 + n
+    else:
+        try:
+            total = float(s.rstrip("sS").strip())
+        except ValueError:
+            return None
+    return None if total < 0 else total
+
+
+def _first_present(d: dict, *keys):
+    """取第一个存在且非 None 的键值（不能用 or，否则 0 秒会被当成缺失）。"""
+    for k in keys:
+        if d.get(k) is not None:
+            return d[k]
+    return None
+
+
 def _bili_rows_to_timeline(rows: list) -> str:
-    """B 站字幕行转 "[MM:SS] 文本" 时间轴格式；无时间信息时退回纯文本行。"""
+    """B 站字幕/AI 总结行转时间轴格式；无时间信息时退回纯文本行。
+
+    字幕有起止时间，输出 "[MM:SS → MM:SS] 文本"（与本地 ASR 输出一致）；
+    AI 总结只有单个 time，输出 "[MM:SS] 文本"，其首行整体总结无时间戳，走纯文本。
+    """
     lines = []
     for r in rows:
         if not isinstance(r, dict):
@@ -1145,11 +1236,15 @@ def _bili_rows_to_timeline(rows: list) -> str:
         content = str(r.get("content") or "").strip()
         if not content:
             continue
-        start = r.get("from") or r.get("start") or r.get("start_time")
-        if isinstance(start, (int, float)):
-            lines.append(f"[{asr_pipeline._fmt_clock(int(float(start) * 1000))}] {content}")
-        else:
+        start = _parse_ts_seconds(_first_present(r, "from", "start", "start_time", "time"))
+        end = _parse_ts_seconds(_first_present(r, "to", "end", "end_time"))
+        if start is None:
             lines.append(content)
+        elif end is None:
+            lines.append(f"[{asr_pipeline._fmt_clock(int(start * 1000))}] {content}")
+        else:
+            lines.append(f"[{asr_pipeline._fmt_clock(int(start * 1000))} → "
+                         f"{asr_pipeline._fmt_clock(int(end * 1000))}] {content}")
     return "\n".join(lines)
 
 
@@ -1206,6 +1301,9 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     v_media, v_name, _ = _first_existing_media(collect_downloaded_files(video_dir, before))
     if v_media:
         media_path, media_name = v_media, v_name
+    elif dl.returncode == 0:
+        # 退出码 0 但目录里没多出视频文件，同样是没拿到正片
+        warnings.append("视频本体下载未产出文件")
 
     set_task(task_id, stage="transcribing", topic=topic_id, message="正在获取字幕/总结", warnings=warnings)
     transcript = ""
@@ -1224,7 +1322,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
             try:
                 rows = json.loads(summ.stdout)
                 if isinstance(rows, list):
-                    transcript = "\n".join(str(r.get("content") or "") for r in rows if isinstance(r, dict))
+                    transcript = _bili_rows_to_timeline(rows)
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"总结解析失败：{e}")
     if transcript:
@@ -1259,7 +1357,9 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": transcript,
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": transcript_source,
-        "downloadStatus": "success" if image_path or media_path else "skipped",
+        **extract_frames(media_path, warnings),
+        # 只下到封面不算 success：B 站帖必然是视频，正片缺了就是 partial
+        "downloadStatus": video_download_status(media_path, image_path),
         "stats": stats,
         "rawMeta": compact_meta("bilibili", {**meta, "bvid": bvid, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
@@ -1331,7 +1431,11 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         "imagePath": image_path, "remoteMedia": [], "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
-        "downloadStatus": "success" if image_path or media_path else ("failed" if dl.returncode != 0 else "skipped"),
+        **extract_frames(media_path, warnings),
+        # 笔记可能是图文也可能是视频，拿不到「应该有几个文件」，只能按下载命令是否报错分档：
+        # 命令失败但落了几个文件 = partial，一个都没落 = failed
+        "downloadStatus": (("success" if dl.returncode == 0 else "partial") if (image_path or media_path)
+                           else ("failed" if dl.returncode != 0 else "skipped")),
         "stats": stats,
         "rawMeta": compact_meta("xiaohongshu", {**meta, "noteId": note_id, "canonicalUrl": detected.get("canonicalUrl") or url}),
         "aiStatus": "pending", "warnings": warnings, "source": "added", "addedAt": now_ts(),
@@ -1561,7 +1665,8 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
-        "downloadStatus": "success" if media_path else ("partial" if image_path else "failed"),
+        **extract_frames(media_path, warnings),
+        "downloadStatus": video_download_status(media_path, image_path),
         "stats": meta.get("stats") or {},
         "rawMeta": compact_meta("douyin", {"awemeId": aweme_id, "desc": meta["desc"][:200],
                                           "author": meta["author"], "shareUrl": url, "canonicalUrl": canonical}),
@@ -1862,6 +1967,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 self.send_error(500, str(e))
             return
+        if path == "/api/meta":
+            # 前端「复制给 AI」要拼本机绝对路径，媒体路径在 posts.json 里是相对内容层
+            # 根的，所以得把根目录告诉前端。
+            with LOCK:
+                self._send_json({"vaultRoot": VAULT_ROOT, "version": DATA_VERSION,
+                                 "posts": len(POSTS), "topics": len(TOPICS)})
+            return
         if path == "/api/topics":
             with LOCK:
                 self._send_json({"topics": public_topics()})
@@ -2065,6 +2177,25 @@ class Handler(BaseHTTPRequestHandler):
                 dirs.add(os.path.dirname(full))
             except Exception as e:  # noqa: BLE001
                 warnings.append(f"文件删除失败：{rel} ({e})")
+        # 关键帧是一整个目录（<视频名>.关键帧/），不在上面按文件删的清单里，
+        # 漏掉的话每删一条视频就在内容层留下一整目录静帧（存量 38 个目录 8MB 量级）。
+        # 这里不能走 _safe_local_path：它是按文件找的，目录命中不了 isfile，
+        # 会回落到第一个根（产品层 app/）的候选路径，导致这段静默不生效。
+        frames_rel = str(post.get("framesDir") or "")
+        if frames_rel:
+            full = os.path.normpath(os.path.join(VAULT_ROOT, frames_rel))
+            # 只删自己抽帧产出的目录：normpath 后必须仍在内容层内，且带抽帧后缀
+            if not full.startswith(VAULT_ROOT + os.sep):
+                warnings.append(f"关键帧目录越界，未删除：{frames_rel}")
+            elif os.path.isdir(full):
+                if not os.path.basename(full).endswith(keyframes.FRAMES_SUFFIX):
+                    warnings.append(f"关键帧目录名不符合抽帧命名，未删除：{frames_rel}")
+                else:
+                    try:
+                        shutil.rmtree(full)
+                        dirs.add(os.path.dirname(full))
+                    except Exception as e:  # noqa: BLE001
+                        warnings.append(f"关键帧目录删除失败：{frames_rel} ({e})")
         # 清理因此变空的媒体子目录（仅 data/media 之下）
         for d in dirs:
             try:
@@ -2123,6 +2254,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/topics/"):
             topic_id = unquote(path[len("/api/topics/"):])
             force = (query.get("force") or ["0"])[0] in ("1", "true", "yes")
+            with_media = (query.get("media") or ["0"])[0] in ("1", "true", "yes")
             with LOCK:
                 topic = next((t for t in TOPICS if t.get("id") == topic_id), None)
                 if not topic:
@@ -2138,7 +2270,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not TOPICS:
                     TOPICS.append(make_default_topic())
                 save_posts()
-            self._send_json({"ok": True, "removed": topic_id, "removedPosts": len(related)})
+            # 连帖子一起删时，媒体文件也一并清理，否则内容层会留下没人引用的孤儿文件
+            warnings = []
+            if with_media:
+                for p in related:
+                    warnings.extend(self._delete_post_files(p))
+            self._send_json({"ok": True, "removed": topic_id,
+                             "removedPosts": len(related), "warnings": warnings})
             return
         self.send_error(404, "Not Found")
 
@@ -2223,6 +2361,12 @@ def main():
     load_posts()
     load_queue()
     check_opencli_profile()
+    # 投影自检：索引行数与主数据条数对不上就全量重建（首启、格式升级、外部改动）
+    if AGENT_PROJECTION and projection.index_is_stale(VAULT_ROOT, len(POSTS)):
+        st = sync_projection(force=True)
+        if st:
+            print(f"[agent] 投影重建：{st['total']} 条 / 写入 {st['written']} / 删除 {st['deleted']}"
+                  f"{' / 失败 ' + str(st['errors']) if st['errors'] else ''}")
     # 启动即校验新版前端入口与关键静态资源是否就位
     required = ["index.html", "tv-glass-theme.css", "tv-glass-app.jsx", "tv-data.js", "tv-api.js"]
     missing = [name for name in required if not os.path.exists(os.path.join(APP_ROOT, name))]

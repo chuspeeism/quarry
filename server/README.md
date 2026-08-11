@@ -44,6 +44,10 @@ vault/
 │   ├── posts.json          v3 主数据（topics + posts）
 │   ├── backups/            版本迁移时自动生成的备份
 │   └── media/              新增采集的媒体，按平台分子目录
+├── agent/                  Agent 可读投影，由 data/posts.json 单向派生
+│   ├── topics.json         课题清单
+│   ├── index.jsonl         一行一帖的轻量索引
+│   └── topics/<课题>/      _topic.md + 一帖一个 <序号>-<标题>.md
 ├── fable5_tweet_media_hq/  历史 X 素材（保留旧 URL 契约）
 ├── fable5_tweet_media/
 ├── outputs/                旧静态页产物
@@ -53,6 +57,18 @@ vault/
 `posts.json` 里的媒体路径一律相对 `VAULT_ROOT`，例如 `data/media/xxx.mp4`、`fable5_tweet_media_hq/xxx.mp4`。
 
 首次启动时如果内容层是空的，会直接初始化一个空库，不需要任何种子文件。
+
+## Agent 投影
+
+`agent/` 是 `data/posts.json` 的只读派生投影，供 `quarry` 命令行与 MCP 服务读取，也供 Agent 直接 grep。写入挂在 `save_posts()` 之后——那是全部数据变更的唯一出口。
+
+- 增量同步与全量重建走同一段渲染代码，两者产物逐字节一致。
+- 投影写入失败不阻断采集链路，错误记入 `agent/.sync-errors.log`。
+- 单帖 md 里的口播全文取自 `transcriptMdPath` 指向的文件，不受 `transcript` 字段 16KB 截断的限制。
+- `rawMeta` 不进投影。
+- 服务启动时比对索引行数与主数据条数，不一致就自动全量重建。
+
+手动重建：`bin/quarry reindex`。改了渲染逻辑要把 `projection.py` 的 `RENDER_VERSION` 加一。
 
 ## 平台支持
 
@@ -82,6 +98,7 @@ vault/
 | `ARK_API_KEY` | — | `AI_ENGINE=ark` 时必填 |
 | `ARK_MODEL` | doubao-seed-1-6-250615 | 豆包模型 |
 | `OPENCLI_BIN` / `CODEX_BIN` | opencli / codex | 可执行文件路径 |
+| `QUARRY_AGENT_PROJECTION` | 1 | 置 0 关闭 `agent/` 投影 |
 
 ## 采集时不要抢你的屏幕
 
@@ -151,7 +168,11 @@ opencli profile rename <contextId> quarry  # 别名叫什么都行，跟下面�
 
 - `GET /api/topics` → `{topics:[{id,name,description,postCount,...}]}`
 - `POST /api/topics` body `{name,id?}` → 创建课题
+- `PATCH /api/topics/<id>` body `{name?,description?}` → 课题改名/改描述（id 不变，帖子按 id 归属）
+- `DELETE /api/topics/<id>` → 删课题；非空必须加 `?force=1` 连帖子一起删，再加 `?media=1` 连本地媒体一起清理。删掉最后一个课题会自动重建默认课题
 - `GET /api/posts?topic=<id>` → 返回指定课题帖子
+- `PATCH /api/posts/<uid>` body `{title?,body?,summary?,keywords?,supplement?}` → 编辑帖子
+- `DELETE /api/posts/<uid>` → 删帖子；`?media=1` 连本地媒体文件一起删
 - `POST /api/add` body `{url,topic}` → `{taskId}`
 - `POST /api/add` body `{urls:[...],topic,defer:true}` → 只入队，返回队列快照
 - `GET /api/task/<id>` → `{stage,progress,postId?,topic,warnings,message?}`
@@ -159,7 +180,33 @@ opencli profile rename <contextId> quarry  # 别名叫什么都行，跟下面�
 - `POST /api/queue/start` / `POST /api/queue/stop` → 开始 / 收尾停止
 - `POST /api/queue/<id>/retry` → 失败的那条重新排队
 - `DELETE /api/queue/<id>` / `DELETE /api/queue` → 删单条 / 清空（正在跑的那条不动）
+- `GET /api/meta` → `{vaultRoot,version,posts,topics}`，前端「复制给 AI」拼本机绝对路径用
+
+## 读取入口（不经过 HTTP 服务）
+
+| 入口 | 文件 | 用途 |
+|------|------|------|
+| 命令行 | `../bin/quarry` → `quarry_cli.py` | 给人用，也给有 shell 的 Agent 用 |
+| MCP | `mcp_server.py` | 给 Claude 桌面端这类够不到磁盘的客户端用，stdio 传输 |
+| 查询内核 | `vault_query.py` | 上面两者共用，保证返回结构一致 |
+
+```bash
+../bin/quarry topics
+../bin/quarry search "提示词" --topic ae
+../bin/quarry show <uid> --full
+python3 mcp_server.py --vault <内容层路径>     # MCP 服务，由客户端拉起
+```
+
+MCP 只暴露四个只读工具：`quarry_list_topics` / `quarry_search` / `quarry_list_posts` / `quarry_get_post`。不实现 HTTP 传输，不做公网暴露。各客户端配置见 [docs/prd-04-agent-read-access.md](../docs/prd-04-agent-read-access.md) §6.2。
 
 ## 转写管线
 
 `asr.py`：ffmpeg 抽音 → 火山豆包 ASR（Groq Whisper 兜底）→ 产出四件套 `mp4 + m4a + srt + 口播词.md`，全部落在内容层。
+
+**「无人声」与「转写失败」是两回事。** 火山返回 errcode `20000003 / no valid speech` 时是一个确定结论，不是引擎故障，此时不落兜底引擎——Whisper 在无人声音频上会自信地编造中文字幕组样板文本（「请不吝点赞订阅转发打赏」之类），用它去兜一个正确的否定判断只会把幻觉写进库里。判定为无人声时 `transcriptSource` 记 `none`，并清掉可能残留的旧 srt / 口播词.md。Groq 的结果还要再过一道幻觉检查（整条都由样板句组成才判定，避免误杀真的说了「记得点赞」的视频）。
+
+## 关键帧
+
+`keyframes.py`：按时长均匀抽 4–12 张静帧到 `<视频名>.关键帧/`，用输入端 seek 逐帧取，不解码全片。
+
+用均匀抽帧而不是场景切换检测，是实测结论：同一条 3 分钟的说话人视频，均匀抽帧 6 张抓到 4 张信息卡片，`select='gt(scene,0.3)'` 抽 7 张全是同一机位、一张卡片没抓到。这类内容机位不切，信息在叠加的文字卡上，一张卡出现时整帧像素差异够不到 scene 阈值。场景检测还要解码全片，慢一个量级。

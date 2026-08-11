@@ -32,6 +32,9 @@ const P = {
   layers: "M8 8h12v12H8zM8 14l3-2 3 3 2-1 2 2M4 4h12M4 4v12",
   home: "M4 11l8-7 8 7M6 9.5V20h12V9.5",
   text: "M5 6h14M5 11h14M5 16h9",
+  edit: "M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z",
+  trash: "M4 6h16M9 6V4h6v2M6 6l1 14h10l1-14M10 10.5v5.5M14 10.5v5.5",
+  copy: "M9 9h10v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V9ZM5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1",
 };
 
 function Icon({ name, size = 18, fill = false, style, strokeWidth = 1.8 }) {

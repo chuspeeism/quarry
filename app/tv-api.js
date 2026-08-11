@@ -4,6 +4,8 @@
  * 把本地 Python 后端（server/server.py）的 /api/* 接口接到新版 React 界面：
  *   - loadAll()            一次拉全部课题与帖子（前端按课题做本地筛选）
  *   - createTopic(n, d)    新建课题            -> POST /api/topics
+ *   - updateTopic(id, f)   课题改名/改描述      -> PATCH /api/topics/<id>
+ *   - deleteTopic(id,f,m)  删除课题(可连帖子/媒体) -> DELETE /api/topics/<id>?force=1&media=1
  *   - addLink(url, topic)  收藏链接，返回 taskId -> POST /api/add
  *   - addLinks(urls, t)    批量收藏，返回 tasks  -> POST /api/add {urls:[...]}
  *   - pollTask(id, onTick) 轮询抓取/AI 进度    -> GET  /api/task/<id>
@@ -76,6 +78,12 @@
     var imageUrl = abs(p.imagePath) || ((Array.isArray(p.remoteMedia) && p.remoteMedia[0]) || "");
     return Object.assign({}, p, {
       contentType: deriveType(p),
+      // 后端自己的内容类型（video/post/note）。contentType 被 deriveType 覆盖成 UI 用的
+      // 卡片类型后就丢了「这本来是个视频」的信息，而判断内容缺没缺全恰恰要靠它：
+      // 视频本体没下下来、只剩封面时，deriveType 会把它算成 image。
+      sourceType: p.contentType || "",
+      downloadStatus: p.downloadStatus || "",
+      warnings: Array.isArray(p.warnings) ? p.warnings : [],
       rawTitle: p.title || "",
       title: cleanTitle(p.title),
       keywords: Array.isArray(p.keywords) ? p.keywords : [],
@@ -115,6 +123,21 @@
   async function createTopic(name, description) {
     var data = await jpost("/api/topics", { name: name, description: description || "" });
     return data.topic;
+  }
+
+  // 课题改名/改描述：课题 id 不动（帖子按 id 归属），返回后端最新的课题对象
+  async function updateTopic(topicId, fields) {
+    var data = await jsend("PATCH", "/api/topics/" + encodeURIComponent(topicId), fields || {});
+    return data.topic || null;
+  }
+
+  // 删除课题：非空课题必须 force（连课题下的帖子一起删）；withMedia 再连本地媒体文件一起删
+  async function deleteTopic(topicId, force, withMedia) {
+    var qs = [];
+    if (force) qs.push("force=1");
+    if (withMedia) qs.push("media=1");
+    var path = "/api/topics/" + encodeURIComponent(topicId) + (qs.length ? "?" + qs.join("&") : "");
+    return jsend("DELETE", path);
   }
 
   async function addLink(url, topic) {
@@ -173,6 +196,8 @@
   window.TVApi = {
     loadAll: loadAll,
     createTopic: createTopic,
+    updateTopic: updateTopic,
+    deleteTopic: deleteTopic,
     addLink: addLink,
     addLinks: addLinks,
     pollTask: pollTask,
