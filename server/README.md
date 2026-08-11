@@ -113,7 +113,11 @@ opencli profile rename <contextId> quarry  # 别名叫什么都行，跟下面�
 ```
 
    别名映射存在 `~/.opencli/browser-profiles.json`，contextId 跨重启稳定，配一次就够。
-   `opencli profile use` 设的**默认** profile 不用动，其它工具照旧走原来的浏览器。
+
+   ⚠️ 多连一个 profile 之后，**不带 `--profile` 的 opencli 调用会直接被拒**
+   （`BROWSER_CONNECT / Multiple Browser Bridge profiles are connected`，exit 69），
+   `opencli profile use` 设的默认值救不了这种情况。Quarry 启动时会自己挑一个显式传，
+   但你在别处手敲 opencli 时要记得带 `--profile`，或者 `export OPENCLI_PROFILE=<别名>`。
 
 4. 把 `QUARRY_OPENCLI_PROFILE=quarry` 写进 `server/.env`（已 gitignore，`start.sh`
    会自动读），或者每次 `QUARRY_OPENCLI_PROFILE=quarry ./start.sh`。

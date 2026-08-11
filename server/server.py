@@ -651,30 +651,64 @@ def detect_platform(url: str) -> dict:
     return {"platform": "unknown", "externalId": slugify_post_id(resolved), "canonicalUrl": resolved}
 
 
-def check_opencli_profile():
-    """启动时确认配置的采集 profile 真连着，没连上就退回默认。
+def list_opencli_profiles():
+    """读 opencli profile list，解析成 [{contextId, alias, default}]。
 
-    配了个不存在的 profile 会让每一条 opencli 命令都失败——整个采集瘫掉，
-    比"窗口开错地方"严重得多。所以这里宁可退回默认并大声提示。
+    输出每行形如 `  wv6jkfus quarry — connected v1.0.22`，没有别名时中间那段就没有，
+    被设成默认的那个会多一个 `default` 标记。opencli 没有 JSON 输出，只能按文本解析。
+    命令跑不起来时返回 None，跟"跑起来了但一个都没连"区分开。
     """
-    global OPENCLI_PROFILE
-    if not OPENCLI_PROFILE:
-        return
     try:
         p = subprocess.run([OPENCLI, "profile", "list"], capture_output=True, text=True,
                            timeout=20, stdin=subprocess.DEVNULL)
-        connected = p.returncode == 0 and any(
-            OPENCLI_PROFILE in line.split() for line in p.stdout.splitlines())
     except Exception:  # noqa: BLE001
-        connected = False
-    if connected:
+        return None
+    if p.returncode != 0:
+        return None
+    out = []
+    for line in p.stdout.splitlines():
+        head, sep, _ = line.partition("—")
+        if not sep:
+            continue
+        tokens = head.split()
+        if not tokens:
+            continue
+        rest = tokens[1:]
+        out.append({
+            "contextId": tokens[0],
+            "alias": next((t for t in rest if t != "default"), ""),
+            "default": "default" in rest,
+        })
+    return out
+
+
+def check_opencli_profile():
+    """启动时把采集用哪个浏览器 profile 定死。
+
+    两种情况都会让采集全线失败，值得在启动时先花一秒问清楚：
+    - 配了个没连上的别名，每条命令都报错；
+    - 同时连着多个 profile 又不指定，opencli 直接拒绝执行
+      （BROWSER_CONNECT / Multiple Browser Bridge profiles are connected，exit 69），
+      注意 `opencli profile use` 设的默认值救不了这种情况，必须显式传。
+    """
+    global OPENCLI_PROFILE
+    profiles = list_opencli_profiles()
+    if profiles is None:
+        return  # opencli 本身就跑不起来，留给真正的采集命令去报错
+    names = {p["contextId"] for p in profiles} | {p["alias"] for p in profiles if p["alias"]}
+    if OPENCLI_PROFILE and OPENCLI_PROFILE in names:
         print(f"[opencli] 采集走专用浏览器 profile：{OPENCLI_PROFILE}")
         return
-    print(f"[opencli] 警告：profile「{OPENCLI_PROFILE}」没连上 Browser Bridge，"
-          "这次采集退回默认浏览器（窗口会开在你正在用的那个浏览器里）")
-    print("          在专用浏览器里装好扩展后，用 opencli profile list 找到 contextId，"
-          f"再 opencli profile rename <contextId> {OPENCLI_PROFILE}，然后重启本服务")
-    OPENCLI_PROFILE = ""
+    if OPENCLI_PROFILE:
+        print(f"[opencli] 警告：profile「{OPENCLI_PROFILE}」没连上 Browser Bridge，本次不用它")
+        print("          在专用浏览器里装好扩展后，用 opencli profile list 找到 contextId，"
+              f"再 opencli profile rename <contextId> {OPENCLI_PROFILE}，然后重启本服务")
+        OPENCLI_PROFILE = ""
+    if len(profiles) > 1:
+        pick = next((p for p in profiles if p["default"]), profiles[0])
+        OPENCLI_PROFILE = pick["alias"] or pick["contextId"]
+        print(f"[opencli] 同时连着 {len(profiles)} 个 Browser Bridge profile，"
+              f"不指定的话 opencli 会拒绝执行，本次显式用：{OPENCLI_PROFILE}")
 
 
 def run_opencli_site(site: str, args, timeout=120):
