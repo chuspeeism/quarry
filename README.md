@@ -21,6 +21,19 @@ cd quarry/server && ./start.sh
 
 依赖：`python3`（仅标准库）、`ffmpeg`（转写用）、`opencli`（抓取用）、`codex` 或火山 Ark API Key（AI 加工用）。
 
+采集靠 opencli 驱动真实浏览器，没有 headless 模式。所以收藏弹窗给了两个按钮：**立即收藏**
+马上抓；**加入队列**只存链接、一个网页都不开，等你离开电脑再按「开始采集」，后端一条一条
+串行跑完。队列落在内容层，关页面、重启服务都还在。
+
+即时收藏这条路也已经尽量少开页、只开背景窗口、同平台复用一个标签页；想让它彻底不挡住
+你手上的活，把采集指到一个你不工作的浏览器 profile：
+
+```bash
+QUARRY_OPENCLI_PROFILE=quarry ./start.sh
+```
+
+配置步骤见 [server/README.md 采集时不要抢你的屏幕](server/README.md#采集时不要抢你的屏幕)。
+
 ## 产品层 / 内容层分离
 
 这是 Quarry 的核心结构约束——代码和素材彻底分开，各自独立演进：

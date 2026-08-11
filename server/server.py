@@ -37,6 +37,7 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -71,6 +72,7 @@ VAULT_ROOT = paths.resolve_vault()
 DATA_DIR = os.path.join(VAULT_ROOT, "data")
 MEDIA_DIR = os.path.join(DATA_DIR, "media")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 V1_BACKUP_FILE = os.path.join(BACKUP_DIR, "posts.v1.bak.json")
 V2_BACKUP_FILE = os.path.join(BACKUP_DIR, "posts.v2.bak.json")
@@ -86,6 +88,14 @@ SEED_FILE = os.path.join(
 PORT = int(os.environ.get("PORT", "6002"))
 OPENCLI = os.environ.get("OPENCLI_BIN", "opencli")
 CODEX = os.environ.get("CODEX_BIN", "codex")
+# opencli 只能驱动真实浏览器（没有 headless 模式），所以采集必然会在某个浏览器里开页。
+# 下面三个开关决定"开在哪、开几个、开完留不留"，默认值按"尽量不打扰用户"来选：
+#   window       背景窗口，不抢应用焦点
+#   profile      指定一个你平时不工作的浏览器 profile 专门跑采集（强烈建议配）
+#   site-session 同一平台复用同一个标签页，而不是每条命令新开一个
+OPENCLI_WINDOW = os.environ.get("QUARRY_OPENCLI_WINDOW", "background")
+OPENCLI_PROFILE = os.environ.get("QUARRY_OPENCLI_PROFILE", "").strip()
+OPENCLI_SITE_SESSION = os.environ.get("QUARRY_OPENCLI_SITE_SESSION", "persistent").strip()
 AI_ENGINE = os.environ.get("AI_ENGINE", "codex").lower()  # codex | ark | none
 ARK_MODEL = os.environ.get("ARK_MODEL", "doubao-seed-1-6-250615")
 ARK_BASE = os.environ.get("ARK_BASE", "https://ark.cn-beijing.volces.com/api/v3")
@@ -117,10 +127,31 @@ LOCK = threading.RLock()
 TOPICS: list = []     # 课题列表
 POSTS: list = []      # 帖子列表（前端字段结构）
 TASKS: dict = {}      # taskId -> {stage, progress, message, postId, topic, warnings}
+# 待采集队列：粘链接时只落一条记录，不碰浏览器；等用户按「开始采集」再逐条跑。
+# 落盘在内容层（data/queue.json），关页面、重启服务都不会丢。
+QUEUE: list = []      # [{id, url, topic, platform, status, addedAt, taskId, message}]
+QUEUE_STATE = {"draining": False, "stopping": False, "currentId": ""}
 # 导入任务并发闸：多条链接同时粘贴时避免 opencli 浏览器桥/ASR 互相争抢
 IMPORT_SEM = threading.Semaphore(
     int(os.environ.get("QUARRY_IMPORT_CONCURRENCY") or os.environ.get("TV_IMPORT_CONCURRENCY", "2"))
 )
+# 浏览器闸：复用标签页时，同一平台同时只允许一条 opencli 命令在跑。
+# 一是同站命令共用一个标签页，并发会把彼此的页面导航掉；
+# 二是同站串行后，一个平台从头到尾只占一个标签页，不会一条命令弹一次窗。
+# 不同平台之间互不影响，仍然可以并行。
+_SITE_LOCKS: dict = {}
+_SITE_LOCKS_GUARD = threading.Lock()
+
+
+def _site_lock(site: str):
+    if OPENCLI_SITE_SESSION != "persistent":
+        return contextlib.nullcontext()
+    with _SITE_LOCKS_GUARD:
+        lock = _SITE_LOCKS.get(site)
+        if lock is None:
+            lock = _SITE_LOCKS[site] = threading.Lock()
+        return lock
+
 
 # ---------------------------------------------------------------------------
 # 帖子存取 + 种子
@@ -643,11 +674,98 @@ def detect_platform(url: str) -> dict:
     return {"platform": "unknown", "externalId": slugify_post_id(resolved), "canonicalUrl": resolved}
 
 
+def list_opencli_profiles():
+    """读 opencli profile list，解析成 [{contextId, alias, default}]。
+
+    输出每行形如 `  wv6jkfus quarry — connected v1.0.22`，没有别名时中间那段就没有，
+    被设成默认的那个会多一个 `default` 标记。opencli 没有 JSON 输出，只能按文本解析。
+    命令跑不起来时返回 None，跟"跑起来了但一个都没连"区分开。
+    """
+    try:
+        p = subprocess.run([OPENCLI, "profile", "list"], capture_output=True, text=True,
+                           timeout=20, stdin=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        return None
+    if p.returncode != 0:
+        return None
+    out = []
+    for line in p.stdout.splitlines():
+        head, sep, _ = line.partition("—")
+        if not sep:
+            continue
+        tokens = head.split()
+        if not tokens:
+            continue
+        rest = tokens[1:]
+        out.append({
+            "contextId": tokens[0],
+            "alias": next((t for t in rest if t != "default"), ""),
+            "default": "default" in rest,
+        })
+    return out
+
+
+def check_opencli_profile():
+    """启动时把采集用哪个浏览器 profile 定死。
+
+    两种情况都会让采集全线失败，值得在启动时先花一秒问清楚：
+    - 配了个没连上的别名，每条命令都报错；
+    - 同时连着多个 profile 又不指定，opencli 直接拒绝执行
+      （BROWSER_CONNECT / Multiple Browser Bridge profiles are connected，exit 69），
+      注意 `opencli profile use` 设的默认值救不了这种情况，必须显式传。
+    """
+    global OPENCLI_PROFILE
+    profiles = list_opencli_profiles()
+    if profiles is None:
+        return  # opencli 本身就跑不起来，留给真正的采集命令去报错
+    names = {p["contextId"] for p in profiles} | {p["alias"] for p in profiles if p["alias"]}
+    if OPENCLI_PROFILE and OPENCLI_PROFILE in names:
+        print(f"[opencli] 采集走专用浏览器 profile：{OPENCLI_PROFILE}")
+        return
+    if OPENCLI_PROFILE:
+        print(f"[opencli] 警告：profile「{OPENCLI_PROFILE}」没连上 Browser Bridge，本次不用它")
+        print("          在专用浏览器里装好扩展后，用 opencli profile list 找到 contextId，"
+              f"再 opencli profile rename <contextId> {OPENCLI_PROFILE}，然后重启本服务")
+        OPENCLI_PROFILE = ""
+    if len(profiles) > 1:
+        pick = next((p for p in profiles if p["default"]), profiles[0])
+        OPENCLI_PROFILE = pick["alias"] or pick["contextId"]
+        print(f"[opencli] 同时连着 {len(profiles)} 个 Browser Bridge profile，"
+              f"不指定的话 opencli 会拒绝执行，本次显式用：{OPENCLI_PROFILE}")
+
+
 def run_opencli_site(site: str, args, timeout=120):
-    cmd = [OPENCLI, site] + args
-    return subprocess.run(cmd, capture_output=True, text=True,
-                          timeout=timeout, stdin=subprocess.DEVNULL,
-                          cwd=VAULT_ROOT)
+    """所有 opencli 调用的唯一出口。
+
+    窗口/profile/会话这三个"别来打扰我"的开关在这里统一注入，调用方不用各自记得写，
+    也就不会再出现某条命令漏了 --window background 就把浏览器怼到最前面的情况。
+    """
+    args = list(args)
+    cmd = [OPENCLI]
+    if OPENCLI_PROFILE:
+        cmd += ["--profile", OPENCLI_PROFILE]
+    cmd += [site] + args
+    if OPENCLI_WINDOW and "--window" not in args:
+        cmd += ["--window", OPENCLI_WINDOW]
+    if OPENCLI_SITE_SESSION and "--site-session" not in args:
+        cmd += ["--site-session", OPENCLI_SITE_SESSION]
+    # 命令行参数之外再兜一层环境变量：opencli 内部再起子命令时也照样是背景窗口
+    env = dict(os.environ)
+    if OPENCLI_WINDOW:
+        env["OPENCLI_WINDOW"] = OPENCLI_WINDOW
+    if OPENCLI_PROFILE:
+        env["OPENCLI_PROFILE"] = OPENCLI_PROFILE
+    with _site_lock(site):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout, stdin=subprocess.DEVNULL,
+                                  cwd=VAULT_ROOT, env=env)
+        except subprocess.TimeoutExpired:
+            # 超时按"这条命令失败"处理，不要炸掉整次导入：浏览器桥被别的活占住时，
+            # 一条字幕命令超时不该让已经抓到的正文和视频全部作废（队列跑无人值守，
+            # 这点尤其要紧）。调用点本来就有 returncode != 0 的降级分支。
+            return subprocess.CompletedProcess(
+                cmd, 124, "", f"opencli {site} {args[0] if args else ''} 超时（{timeout}s），已跳过")
 
 
 def run_opencli(args, timeout=120):
@@ -655,8 +773,7 @@ def run_opencli(args, timeout=120):
 
 
 def fetch_thread(tid: str):
-    p = run_opencli(["thread", tid, "--limit", "1", "-f", "json",
-                     "--window", "background"])
+    p = run_opencli(["thread", tid, "--limit", "1", "-f", "json"])
     if p.returncode != 0:
         raise RuntimeError(f"opencli thread 失败(exit {p.returncode}): {p.stderr[:200]}")
     data = json.loads(p.stdout)
@@ -666,7 +783,7 @@ def fetch_thread(tid: str):
 
 
 def fetch_article(tid: str):
-    p = run_opencli(["article", tid, "-f", "json", "--window", "background"])
+    p = run_opencli(["article", tid, "-f", "json"])
     if p.returncode != 0:
         return None
     try:
@@ -1037,6 +1154,34 @@ def _finish_ai(post: dict, text: str, handle: str, platform: str, warnings: list
             save_posts()
 
 
+def fetch_bilibili_view(bvid: str) -> dict:
+    """B 站稿件详情走公开接口拿，不占浏览器。
+
+    标题/简介/封面/UP 主/播放点赞收藏评论分享这一整套都在这个接口里，且不需要登录。
+    拿不到就返回 {}，调用方自己退回 opencli。
+    """
+    if not re.fullmatch(r"BV[0-9A-Za-z]+", bvid or ""):
+        return {}
+    api = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+    try:
+        req = urllib.request.Request(api, headers={
+            "User-Agent": UA, "Referer": f"https://www.bilibili.com/video/{bvid}/"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "ignore"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        return {}
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return {}
+    meta = dict(data)
+    pubdate = data.get("pubdate")
+    if isinstance(pubdate, (int, float)) and pubdate > 0:
+        meta["published"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(pubdate)))
+    return meta
+
+
 def _parse_ts_seconds(value) -> "float | None":
     """把时间戳解析成秒，兼容三种形态；解析不出来返回 None。
 
@@ -1114,15 +1259,17 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         return
 
     set_task(task_id, stage="fetching", topic=topic_id, message="正在抓取 B 站视频信息")
-    meta = {}
-    p = run_opencli_site("bilibili", ["video", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
-    if p.returncode == 0:
-        try:
-            meta = normalize_opencli_kv(json.loads(p.stdout))
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"B 站元数据解析失败：{e}")
-    else:
-        warnings.append(f"B 站元数据抓取失败：{p.stderr[:120]}")
+    # 标题/简介/封面/UP 主/互动数据走 B 站公开接口，不用开浏览器；失败才退回 opencli
+    meta = fetch_bilibili_view(bvid)
+    if not meta:
+        p = run_opencli_site("bilibili", ["video", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
+        if p.returncode == 0:
+            try:
+                meta = normalize_opencli_kv(json.loads(p.stdout))
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"B 站元数据解析失败：{e}")
+        else:
+            warnings.append(f"B 站元数据抓取失败：{p.stderr[:120]}")
     title = str(meta.get("title") or meta.get("标题") or f"Bilibili {bvid}")
     owner = meta.get("owner")
     if isinstance(owner, dict):
@@ -1148,7 +1295,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     os.makedirs(video_dir, exist_ok=True)
     before = snapshot_files(video_dir)
     dl = run_opencli_site("bilibili", ["download", bvid, "--output", video_dir,
-                                      "-f", "json", "--window", "background"], timeout=1200)
+                                      "-f", "json"], timeout=1200)
     if dl.returncode != 0:
         warnings.append(f"视频本体下载失败：{(dl.stderr or dl.stdout or '')[:120]}")
     v_media, v_name, _ = _first_existing_media(collect_downloaded_files(video_dir, before))
@@ -1161,7 +1308,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
     set_task(task_id, stage="transcribing", topic=topic_id, message="正在获取字幕/总结", warnings=warnings)
     transcript = ""
     transcript_source = ""
-    sub = run_opencli_site("bilibili", ["subtitle", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+    sub = run_opencli_site("bilibili", ["subtitle", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
     if sub.returncode == 0:
         try:
             rows = json.loads(sub.stdout)
@@ -1170,7 +1317,7 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         except Exception as e:  # noqa: BLE001
             warnings.append(f"字幕解析失败：{e}")
     if not transcript:
-        summ = run_opencli_site("bilibili", ["summary", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+        summ = run_opencli_site("bilibili", ["summary", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
         if summ.returncode == 0:
             try:
                 rows = json.loads(summ.stdout)
@@ -1235,7 +1382,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
 
     set_task(task_id, stage="fetching", topic=topic_id, message="正在抓取小红书笔记信息")
     meta = {}
-    p = run_opencli_site("xiaohongshu", ["note", detected.get("canonicalUrl") or url, "-f", "json", "--window", "background"], timeout=120)
+    p = run_opencli_site("xiaohongshu", ["note", detected.get("canonicalUrl") or url, "-f", "json"], timeout=120)
     if p.returncode == 0:
         try:
             meta = normalize_opencli_kv(json.loads(p.stdout))
@@ -1248,7 +1395,7 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
     output_dir = os.path.join(MEDIA_DIR, "xiaohongshu", note_id)
     os.makedirs(output_dir, exist_ok=True)
     before = snapshot_files(output_dir)
-    dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", output_dir, "-f", "json", "--window", "background"], timeout=180)
+    dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", output_dir, "-f", "json"], timeout=180)
     if dl.returncode != 0:
         warnings.append(f"小红书媒体下载失败：{dl.stderr[:120]}")
     files = collect_downloaded_files(output_dir, before)
@@ -1307,7 +1454,7 @@ def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
     """策略 A：链接里带 sec_uid（用户页 modal 链接）时，从作品列表精确匹配。"""
     p = run_opencli_site("douyin", ["user-videos", sec_uid, "--limit", "20",
                                    "--with_comments", "true", "--comment_limit", "5",
-                                   "-f", "json", "--window", "background"], timeout=240)
+                                   "-f", "json"], timeout=240)
     if p.returncode != 0:
         raise RuntimeError(f"opencli douyin user-videos 失败：{(p.stderr or '')[:120]}")
     rows = json.loads(p.stdout)
@@ -1561,6 +1708,150 @@ def _process_add_inner(task_id: str, url: str, topic_id: str):
         set_task(task_id, stage="error", topic=topic_id, message=str(e))
 
 
+# ---------------------------------------------------------------------------
+# 待采集队列：先存链接，等人不在电脑前了再批量跑
+# ---------------------------------------------------------------------------
+
+def guess_platform(url: str) -> str:
+    """只看域名猜平台，不发任何请求。
+
+    入队要快、要不打扰人，所以不能像 detect_platform() 那样为了短链去发 HEAD；
+    真正的平台识别留到出队真跑的时候做。
+    """
+    host = urlparse(url).netloc.lower()
+    if "bilibili.com" in host or "b23.tv" in host:
+        return "bilibili"
+    if "xiaohongshu.com" in host or "xhslink.com" in host:
+        return "xiaohongshu"
+    if "douyin.com" in host or "iesdouyin.com" in host:
+        return "douyin"
+    if "x.com" in host or "twitter.com" in host:
+        return "x"
+    return ""
+
+
+def load_queue():
+    global QUEUE
+    if not os.path.exists(QUEUE_FILE):
+        QUEUE = []
+        return
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception as e:  # noqa: BLE001
+        print(f"[queue] 读取失败，按空队列启动：{e}")
+        QUEUE = []
+        return
+    items = raw.get("items") if isinstance(raw, dict) else raw
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not it.get("url"):
+            continue
+        # 上次是跑到一半被关掉的，重启后回到待采集，让用户自己决定什么时候重来
+        status = it.get("status") if it.get("status") in ("queued", "error") else "queued"
+        out.append({
+            "id": str(it.get("id") or uuid.uuid4().hex[:12]),
+            "url": str(it["url"]),
+            "topic": str(it.get("topic") or ""),
+            "platform": str(it.get("platform") or guess_platform(str(it["url"]))),
+            "status": status,
+            "addedAt": int(it.get("addedAt") or now_ts()),
+            "taskId": "",
+            "message": str(it.get("message") or ""),
+        })
+    QUEUE = out
+    if QUEUE:
+        print(f"[queue] 待采集 {len(QUEUE)} 条（在界面上按「开始采集」才会跑）")
+
+
+def save_queue():
+    tmp = QUEUE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"version": 1, "items": QUEUE}, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, QUEUE_FILE)
+
+
+def enqueue_links(urls: list, topic_id: str) -> list:
+    """把链接压进待采集队列。同一课题下重复的链接直接跳过。"""
+    added = []
+    with LOCK:
+        seen = {(it["topic"], it["url"]) for it in QUEUE}
+        for url in urls:
+            if (topic_id, url) in seen:
+                continue
+            seen.add((topic_id, url))
+            item = {
+                "id": uuid.uuid4().hex[:12], "url": url, "topic": topic_id,
+                "platform": guess_platform(url), "status": "queued",
+                "addedAt": now_ts(), "taskId": "", "message": "",
+            }
+            QUEUE.append(item)
+            added.append(item)
+        if added:
+            save_queue()
+    return added
+
+
+def queue_snapshot() -> dict:
+    with LOCK:
+        return {
+            "items": [dict(it) for it in QUEUE],
+            "draining": QUEUE_STATE["draining"],
+            "stopping": QUEUE_STATE["stopping"],
+            "queued": sum(1 for it in QUEUE if it["status"] == "queued"),
+        }
+
+
+def _drain_queue():
+    """逐条把队列跑完。串行是故意的：一次只占一个浏览器标签页。"""
+    try:
+        while True:
+            with LOCK:
+                if QUEUE_STATE["stopping"]:
+                    break
+                item = next((it for it in QUEUE if it["status"] == "queued"), None)
+                if item is None:
+                    break
+                task_id = uuid.uuid4().hex[:12]
+                item["status"] = "running"
+                item["taskId"] = task_id
+                item["message"] = "已创建任务"
+                QUEUE_STATE["currentId"] = item["id"]
+                save_queue()
+            set_task(task_id, stage="pending", topic=item["topic"], message="已创建任务", warnings=[])
+            process_add(task_id, item["url"], item["topic"])
+            task = get_task(task_id)
+            with LOCK:
+                still = next((it for it in QUEUE if it["id"] == item["id"]), None)
+                if still is not None:
+                    if task.get("stage") == "error":
+                        # 失败的留在队列里显示原因，用户可以重试或删掉
+                        still["status"] = "error"
+                        still["message"] = task.get("message") or "采集失败"
+                        still["taskId"] = ""
+                    else:
+                        QUEUE.remove(still)
+                QUEUE_STATE["currentId"] = ""
+                save_queue()
+    finally:
+        with LOCK:
+            QUEUE_STATE["draining"] = False
+            QUEUE_STATE["stopping"] = False
+            QUEUE_STATE["currentId"] = ""
+
+
+def start_queue() -> dict:
+    with LOCK:
+        if QUEUE_STATE["draining"]:
+            return queue_snapshot()
+        if not any(it["status"] == "queued" for it in QUEUE):
+            return queue_snapshot()
+        QUEUE_STATE["draining"] = True
+        QUEUE_STATE["stopping"] = False
+    threading.Thread(target=_drain_queue, daemon=True).start()
+    return queue_snapshot()
+
+
 def build_app_html() -> bytes:
     # 新版 Quarry（Frost）前端是自包含的 React 应用，自己通过 /api/* 实时加载数据，
     # 不再需要运行时注入。旧版 vanilla 注入逻辑保留在 index.legacy.html 与 git 历史中。
@@ -1700,10 +1991,41 @@ class Handler(BaseHTTPRequestHandler):
             tid = path[len("/api/task/"):]
             self._send_json(get_task(tid))
             return
+        if path == "/api/queue":
+            self._send_json(queue_snapshot())
+            return
         self._serve_static(path)
 
     def do_POST(self):
         path = urlparse(self.path).path
+
+        # --- 待采集队列 ---
+        if path == "/api/queue/start":
+            self._send_json(start_queue())
+            return
+        if path == "/api/queue/stop":
+            with LOCK:
+                if QUEUE_STATE["draining"]:
+                    QUEUE_STATE["stopping"] = True
+            self._send_json(queue_snapshot())
+            return
+        m = re.fullmatch(r"/api/queue/([^/]+)/retry", path)
+        if m:
+            qid = unquote(m.group(1))
+            with LOCK:
+                item = next((it for it in QUEUE if it["id"] == qid), None)
+                if not item:
+                    self._send_json({"error": f"队列里没有这一条：{qid}"}, 404)
+                    return
+                if item["status"] == "running":
+                    self._send_json({"error": "这一条正在采集中"}, 400)
+                    return
+                item["status"] = "queued"
+                item["message"] = ""
+                save_queue()
+            self._send_json(queue_snapshot())
+            return
+
         if path == "/api/topics":
             try:
                 payload = self._read_json()
@@ -1804,6 +2126,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "请提供有效的平台内容链接"}, 400)
             return
 
+        # defer=true：只把链接压进待采集队列，一个浏览器页都不开
+        if payload.get("defer"):
+            added = enqueue_links(url_list, topic_id)
+            snap = queue_snapshot()
+            snap["added"] = added
+            snap["skipped"] = len(url_list) - len(added)
+            self._send_json(snap)
+            return
+
         if len(url_list) == 1 and not isinstance(raw_urls, list):
             # 单条：保持原有契约（预检平台，直接返回 taskId）
             url = url_list[0]
@@ -1878,6 +2209,35 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        # --- 待采集队列：清空 / 删单条（正在跑的那条不动）---
+        if path == "/api/queue":
+            with LOCK:
+                kept = [it for it in QUEUE if it["status"] == "running"]
+                removed = len(QUEUE) - len(kept)
+                QUEUE[:] = kept
+                save_queue()
+            snap = queue_snapshot()
+            snap["removed"] = removed
+            self._send_json(snap)
+            return
+        if path.startswith("/api/queue/"):
+            qid = unquote(path[len("/api/queue/"):])
+            with LOCK:
+                item = next((it for it in QUEUE if it["id"] == qid), None)
+                if not item:
+                    self._send_json({"error": f"队列里没有这一条：{qid}"}, 404)
+                    return
+                if item["status"] == "running":
+                    self._send_json({"error": "这一条正在采集中，先停止队列再删"}, 400)
+                    return
+                QUEUE.remove(item)
+                save_queue()
+            snap = queue_snapshot()
+            snap["removed"] = 1
+            self._send_json(snap)
+            return
+
         if path.startswith("/api/posts/"):
             uid = unquote(path[len("/api/posts/"):])
             with_media = (query.get("media") or ["0"])[0] in ("1", "true", "yes")
@@ -1999,6 +2359,8 @@ def lan_ip() -> str:
 def main():
     _ensure_dirs()
     load_posts()
+    load_queue()
+    check_opencli_profile()
     # 投影自检：索引行数与主数据条数对不上就全量重建（首启、格式升级、外部改动）
     if AGENT_PROJECTION and projection.index_is_stale(VAULT_ROOT, len(POSTS)):
         st = sync_projection(force=True)

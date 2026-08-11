@@ -81,6 +81,9 @@ vault/
 
 ## 环境变量
 
+本机固定的配置可以写进 `server/.env`（每行 `KEY=value`，已 gitignore），`start.sh` 会自动
+读进来；命令行上现给的环境变量优先级更高，不会被 `.env` 覆盖。
+
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `PORT` | 6002 | 监听端口 |
@@ -88,11 +91,78 @@ vault/
 | `QUARRY_DEFAULT_TOPIC_ID` | `inbox` | 默认课题 id |
 | `QUARRY_DEFAULT_TOPIC_NAME` | 未归类 | 默认课题名 |
 | `QUARRY_IMPORT_CONCURRENCY` | 2 | 并发导入闸门 |
+| `QUARRY_OPENCLI_PROFILE` | — | 采集专用的浏览器 profile 别名，见下节；没连上会警告并退回默认 |
+| `QUARRY_OPENCLI_WINDOW` | background | opencli 窗口模式，`background` / `foreground` |
+| `QUARRY_OPENCLI_SITE_SESSION` | persistent | 同平台复用同一标签页；置空则每条命令新开一个 |
 | `AI_ENGINE` | codex | `codex` / `ark` / `none` |
 | `ARK_API_KEY` | — | `AI_ENGINE=ark` 时必填 |
 | `ARK_MODEL` | doubao-seed-1-6-250615 | 豆包模型 |
 | `OPENCLI_BIN` / `CODEX_BIN` | opencli / codex | 可执行文件路径 |
 | `QUARRY_AGENT_PROJECTION` | 1 | 置 0 关闭 `agent/` 投影 |
+
+## 采集时不要抢你的屏幕
+
+opencli 没有 headless 模式，抓取一定要在一个真实浏览器里开页。默认情况下它用的就是你
+自己那个装了 Browser Bridge 扩展的浏览器，所以采集窗口会盖在你正在看的页面上面。
+
+后端这边已经做到的：
+
+- 所有 opencli 调用收敛到 `run_opencli_site()` 一个出口，统一带 `--window background`
+  并同时设 `OPENCLI_WINDOW` 环境变量，不存在哪条命令漏掉的可能
+- `--site-session persistent`：同一平台的多条命令复用同一个标签页，而不是一条命令开一个
+- 同平台的 opencli 命令串行执行，一个平台从头到尾只占一个标签页；不同平台之间照旧并行。
+  代价是一次粘一堆同平台链接时会排队，想换回并行就设 `QUARRY_OPENCLI_SITE_SESSION=`（置空）
+- B 站的标题/简介/封面/UP 主/互动数据改走公开接口，完全不开浏览器
+
+剩下那一次窗口，唯一的根治办法是**别让它开在你正在用的浏览器里**：
+
+1. 挑一个你平时不干活的浏览器（比如日常用 Dia，就拿 Google Chrome 来跑采集），
+   在里面装上 [Browser Bridge 扩展](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk)。
+   **必须走 Chrome 应用商店**：Chrome 137 起命令行 `--load-extension` 已经被禁掉，
+   本地解包目录加不进去了
+2. 在这个浏览器里登好 B 站 / 小红书 / 抖音 / X——采集用的就是它的登录态，
+   跟你日常浏览器的登录态是两套
+3. 起一次这个浏览器，然后给它起个别名：
+
+```bash
+opencli profile list                       # 找到新出现的 contextId
+opencli profile rename <contextId> quarry  # 别名叫什么都行，跟下面对上即可
+```
+
+   别名映射存在 `~/.opencli/browser-profiles.json`，contextId 跨重启稳定，配一次就够。
+
+   ⚠️ 多连一个 profile 之后，**不带 `--profile` 的 opencli 调用会直接被拒**
+   （`BROWSER_CONNECT / Multiple Browser Bridge profiles are connected`，exit 69），
+   `opencli profile use` 设的默认值救不了这种情况。Quarry 启动时会自己挑一个显式传，
+   但你在别处手敲 opencli 时要记得带 `--profile`，或者 `export OPENCLI_PROFILE=<别名>`。
+
+4. 把 `QUARRY_OPENCLI_PROFILE=quarry` 写进 `server/.env`（已 gitignore，`start.sh`
+   会自动读），或者每次 `QUARRY_OPENCLI_PROFILE=quarry ./start.sh`。
+   启动时会校验这个 profile 是不是真连着：连上了打印
+   `[opencli] 采集走专用浏览器 profile：quarry`，没连上会警告并**退回默认浏览器**
+   ——配错别名不会让整个采集瘫掉，只是窗口又开回原来的地方
+5. macOS 上再把这个浏览器拖到另一个桌面（Space）：右键 Dock 图标 →「选项」→
+   「此桌面」。之后采集窗口只会在那个桌面里开合，不再盖住你手上的活。
+
+## 待采集队列：只存链接，稍后批量采集
+
+上面那套是"少开、开在别处"，队列是另一条路——**这段时间干脆一个网页都不开**。
+
+收藏弹窗里有两个按钮，每次自己选，没有隐藏开关：
+
+| 按钮 | 行为 |
+|------|------|
+| 立即收藏 | 马上抓，进度显示在列表顶部的预览卡片里（原有行为，没变） |
+| 加入队列 | 只把链接记到队列里，零网页、零抓取；等你按「开始采集」才跑 |
+
+队列落盘在内容层 `data/queue.json`，**关页面、重启服务都还在**。上次跑到一半被关掉的
+那条会退回"待采集"，由你决定什么时候重来。
+
+跑起来之后是**一条一条串行**跑的：整批采集全程只占一个浏览器标签页。成功的自动出队，
+失败的留在队列里显示原因，可以单独重试或移除。「停止」是跑完当前这条就停，不会把
+正在处理的内容截断成半成品。
+
+界面上队列条是跨课题的（每条带课题标签），队列空时整条不显示。
 
 ## 接口
 
@@ -104,7 +174,12 @@ vault/
 - `PATCH /api/posts/<uid>` body `{title?,body?,summary?,keywords?,supplement?}` → 编辑帖子
 - `DELETE /api/posts/<uid>` → 删帖子；`?media=1` 连本地媒体文件一起删
 - `POST /api/add` body `{url,topic}` → `{taskId}`
+- `POST /api/add` body `{urls:[...],topic,defer:true}` → 只入队，返回队列快照
 - `GET /api/task/<id>` → `{stage,progress,postId?,topic,warnings,message?}`
+- `GET /api/queue` → `{items,draining,stopping,queued}`
+- `POST /api/queue/start` / `POST /api/queue/stop` → 开始 / 收尾停止
+- `POST /api/queue/<id>/retry` → 失败的那条重新排队
+- `DELETE /api/queue/<id>` / `DELETE /api/queue` → 删单条 / 清空（正在跑的那条不动）
 - `GET /api/meta` → `{vaultRoot,version,posts,topics}`，前端「复制给 AI」拼本机绝对路径用
 
 ## 读取入口（不经过 HTTP 服务）

@@ -355,9 +355,10 @@ function EditModal({ post, onClose, onSaved }) {
 }
 
 /* ===================== collect (paste link, 支持多行批量) ===================== */
-// 点「收藏」后立即把链接交给 App 层的收藏队列（onQueue）并关闭弹窗：
-// 抓取/AI 的实时进度显示在列表顶部的预览卡片里，用户可以继续浏览和操作。
-function CollectModal({ topics, defaultTopic, onClose, onQueue }) {
+// 两条出路，每次都由用户明说，不设隐藏开关：
+//   立即收藏（onQueue）  马上抓，进度显示在列表顶部的预览卡片里
+//   加入队列（onDefer）  只存链接、一个浏览器页都不开，等你离开电脑再按「开始采集」
+function CollectModal({ topics, defaultTopic, onClose, onQueue, onDefer }) {
   const [url, setUrl] = useState("");
   const [topic, setTopic] = useState(defaultTopic);
   const inputRef = useRef(null);
@@ -376,6 +377,11 @@ function CollectModal({ topics, defaultTopic, onClose, onQueue }) {
     onQueue(links, topic);
   }
 
+  function defer() {
+    if (!links.length) return;
+    onDefer(links, topic);
+  }
+
   return m("div", { className: "tv-overlay", onMouseDown: (e) => { if (e.target === e.currentTarget) onClose(); } },
     m("div", { className: "tv-modal" },
       m("button", { className: "tv-detail-x", onClick: onClose, style: { top: 16, right: 16 } }, m(Icon, { name: "close", size: 16 })),
@@ -383,7 +389,7 @@ function CollectModal({ topics, defaultTopic, onClose, onQueue }) {
         m("div", { className: "mi" }, m(Icon, { name: "link", size: 19 })),
         m("div", null,
           m("h3", null, "收藏链接"),
-          m("p", null, "粘贴 X / B站 / 小红书 / 抖音 链接，支持多行批量。收藏后立即开卡，进度在列表顶部实时显示。")
+          m("p", null, "粘贴 X / B站 / 小红书 / 抖音 链接，支持多行批量。急着看就立即收藏；不想被采集窗口打断，就加入队列，等你离开电脑再统一跑。")
         )
       ),
       m(React.Fragment, null,
@@ -425,6 +431,9 @@ function CollectModal({ topics, defaultTopic, onClose, onQueue }) {
         m("div", { className: "tv-modal-foot" },
           m("div", { className: "spacer" }),
           m("button", { className: "tv-btn ghost", onClick: onClose }, "取消"),
+          m("button", { className: "tv-btn ghost", disabled: !links.length, onClick: defer,
+            title: "只存链接，一个网页都不开；等你离开电脑再按「开始采集」" },
+            m(Icon, { name: "clock", size: 15 }), multi ? "加入队列 " + links.length + " 条" : "加入队列"),
           m("button", { className: "tv-btn primary", disabled: !links.length, onClick: start },
             m(Icon, { name: "download", size: 15 }), multi ? "立即收藏 " + links.length + " 条" : "立即收藏")
         )
