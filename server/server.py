@@ -44,6 +44,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -297,7 +298,9 @@ def compact_meta(platform: str, meta: dict) -> dict:
     allowed = {
         "x": {"id", "author", "text", "created_at", "url", "likes", "retweets", "replies", "views", "bookmarks", "quotes", "media_urls"},
         "bilibili": {"bvid", "aid", "cid", "title", "author", "owner", "duration", "stat", "pic", "thumbnail", "desc", "description", "publish_time", "canonicalUrl"},
-        "xiaohongshu": {"noteId", "title", "desc", "author", "likedCount", "collectedCount", "commentCount", "canonicalUrl"},
+        # content/likes/collects/comments/tags 是 opencli xiaohongshu note 实际返回的键名
+        "xiaohongshu": {"noteId", "title", "content", "desc", "author", "likes", "collects",
+                        "comments", "tags", "likedCount", "collectedCount", "commentCount", "canonicalUrl"},
         "douyin": {"awemeId", "desc", "author", "shareUrl", "canonicalUrl"},
     }.get(platform, set())
     out = {}
@@ -331,7 +334,7 @@ STATS_KEY_CANDIDATES = {
     "xiaohongshu": {
         "views": ("viewCount", "view_count", "浏览量", "浏览"),
         "likes": ("likedCount", "liked_count", "likes", "点赞", "点赞数"),
-        "collects": ("collectedCount", "collected_count", "收藏", "收藏数"),
+        "collects": ("collectedCount", "collected_count", "collects", "收藏", "收藏数"),
         "comments": ("commentCount", "comment_count", "comments", "评论", "评论数"),
         "shares": ("shareCount", "share_count", "分享", "分享数"),
     },
@@ -438,6 +441,29 @@ def collect_downloaded_files(directory: str, before=None) -> list:
     files = [p for p in after - before if os.path.isfile(p)]
     files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return files
+
+
+def adopt_downloaded_files(staging: str, dest: str) -> list:
+    """把 opencli 下到临时目录的文件收进 dest，返回落地路径（新 -> 旧）。
+
+    opencli 的 download 会在 --output 底下再按它自己解析出的笔记 id 建一层目录，
+    把 <平台>/<id> 直接传进去就套娃成 <平台>/<id>/<id>/xxx.mp4；而且那层目录名是
+    它从页面解析的 id，未必等于 Quarry 这边的 externalId。改成先下到一次性临时
+    目录再搬运，落地层级和目录名都由 Quarry 说了算，也不会跟并发的另一条导入抢
+    同一个基准目录。
+    """
+    sources = [os.path.join(root, name)
+               for root, _, names in os.walk(staging) for name in names]
+    if not sources:
+        return []
+    os.makedirs(dest, exist_ok=True)
+    landed = []
+    for src in sources:
+        target = os.path.join(dest, os.path.basename(src))
+        os.replace(src, target)
+        landed.append(target)
+    landed.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return landed
 
 
 def classify_local_file(path: str) -> str:
@@ -646,6 +672,26 @@ def extract_xhs_id(url: str) -> str:
         return m.group(1)
     m = re.search(r"source=note&noteId=([0-9a-zA-Z]+)", url)
     return m.group(1) if m else slugify_post_id(url)
+
+
+def xhs_published_from_note_id(note_id: str) -> str:
+    """从小红书笔记 id 反推发布时间。
+
+    opencli 的 xiaohongshu note 只返回 title/author/content/likes/collects/
+    comments/tags，压根没有发布时间这一项。笔记 id 是 MongoDB ObjectId 那套格式，
+    前 8 位十六进制就是 id 生成时刻的 Unix 时间戳，约等于发布时刻（opencli 自己
+    的 search 也是这么给 published_at 的）。拿不准的 id 一律返回空。
+
+    统一按北京时间渲染：小红书页面上显示的就是北京时间，跑服务的机器时区不一定
+    是 +8，跟着本机时区走卡片会跟原帖对不上（机器在美西就差了 15 小时）。
+    """
+    nid = (note_id or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{24}", nid):
+        return ""
+    ts = int(nid[:8], 16)
+    if not 1_000_000_000 <= ts <= 4_000_000_000:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts + 8 * 3600))
 
 
 def extract_douyin_id(url: str) -> str:
@@ -1392,17 +1438,23 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         warnings.append("小红书 note 抓取失败，可能缺少 xsec_token；尝试仅下载媒体。")
 
     set_task(task_id, stage="downloading", topic=topic_id, message="正在下载小红书媒体", warnings=warnings)
-    output_dir = os.path.join(MEDIA_DIR, "xiaohongshu", note_id)
-    os.makedirs(output_dir, exist_ok=True)
-    before = snapshot_files(output_dir)
-    dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", output_dir, "-f", "json"], timeout=180)
-    if dl.returncode != 0:
-        warnings.append(f"小红书媒体下载失败：{dl.stderr[:120]}")
-    files = collect_downloaded_files(output_dir, before)
+    # opencli 会在 --output 里再建一层笔记 id 目录，不能把 <平台>/<note_id> 直接给它，
+    # 否则套娃成 .../<note_id>/<note_id>/xxx.mp4。下到一次性临时目录再收进笔记目录。
+    xhs_root = os.path.join(MEDIA_DIR, "xiaohongshu")
+    os.makedirs(xhs_root, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=".downloading-", dir=xhs_root)
+    try:
+        dl = run_opencli_site("xiaohongshu", ["download", detected.get("canonicalUrl") or url, "--output", staging, "-f", "json"], timeout=180)
+        if dl.returncode != 0:
+            warnings.append(f"小红书媒体下载失败：{dl.stderr[:120]}")
+        files = adopt_downloaded_files(staging, os.path.join(xhs_root, note_id))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     media_path, media_name, image_path = _first_existing_media(files)
 
     title = str(meta.get("title") or meta.get("标题") or "小红书笔记")
-    body_text = str(meta.get("desc") or meta.get("正文") or meta.get("description") or "")
+    # note 命令的正文键是 content，不是 desc；取错了正文会整段丢失，只剩标题喂给 AI
+    body_text = str(meta.get("content") or meta.get("desc") or meta.get("正文") or meta.get("description") or "")
     author = str(meta.get("author") or meta.get("作者") or "")
     stats = build_stats("xiaohongshu", meta)
 
@@ -1424,7 +1476,9 @@ def process_add_xiaohongshu(task_id: str, url: str, topic_id: str, detected: dic
         "uid": uid, "id": uid, "topic": topic_id, "platform": "xiaohongshu", "externalId": note_id,
         "contentType": "note", "file": detected.get("canonicalUrl") or url, "title": title,
         "number": next_number(topic_id), "tweetId": "", "author": author, "handle": author,
-        "published": str(meta.get("published") or meta.get("发布时间") or ""),
+        # note 命令不返回发布时间，从笔记 id 反推；哪天平台补上了就优先用平台的
+        "published": (str(meta.get("published") or meta.get("发布时间") or "")
+                      or xhs_published_from_note_id(note_id)),
         "body": "🤖 正在生成中文内容卡片…", "summary": "", "originalText": material,
         "originalIsExcerpt": False, "originalNote": "", "keywords": [], "supplement": "",
         "sourceLink": detected.get("canonicalUrl") or url, "mediaPath": media_path, "mediaName": media_name,
