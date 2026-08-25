@@ -805,6 +805,53 @@ def format_published(created_at: str) -> str:
         return created_at or ""
 
 
+# opencli thread 给的 media_urls 里，视频取的是 variants 里第一条 mp4。Twitter 的 variants
+# 按码率升序排列，第一条恒为最低档（实测 480x270 / 256kbps，同一条推文另有 1280x720 / 2176kbps）。
+# 这里用免登录的 syndication 端点重新取一次完整 variants，按码率挑最高的那条。
+TWITTER_SYNDICATION = "https://cdn.syndication.twimg.com/tweet-result?id={tid}&token=a&lang=en"
+
+
+def _twimg_media_id(url: str) -> str:
+    """从 video.twimg.com 直链里取出媒体 ID，用于把变体对回原来那条视频。"""
+    m = re.search(r"/(?:amplify_video|ext_tw_video|tweet_video)/(\d+)/", url or "")
+    return m.group(1) if m else ""
+
+
+def fetch_twitter_best_variants(tid: str) -> dict:
+    """返回 media_id -> 最高码率 mp4 直链；取不到时抛异常，调用方沿用原地址。"""
+    req = urllib.request.Request(TWITTER_SYNDICATION.format(tid=tid),
+                                 headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8", "ignore"))
+    details = data.get("mediaDetails")
+    best = {}
+    for d in details if isinstance(details, list) else []:
+        if not isinstance(d, dict):
+            continue
+        variants = (d.get("video_info") or {}).get("variants")
+        mp4s = [v for v in (variants or []) if isinstance(v, dict)
+                and v.get("content_type") == "video/mp4" and v.get("url")]
+        if not mp4s:
+            continue
+        top = max(mp4s, key=lambda v: v.get("bitrate") or 0)
+        mid = _twimg_media_id(str(top["url"]))
+        if mid:
+            best[mid] = str(top["url"])
+    return best
+
+
+def upgrade_x_media_url(url: str, best_variants: dict) -> str:
+    """把单条 X 媒体地址换成最高清版本：视频换最高码率变体，图片补 name=orig。"""
+    if not url:
+        return url
+    if "pbs.twimg.com" in url:
+        # 裸地址等价于 name=medium（长边封顶 1200），name=orig 才是上传时的原图
+        if "name=" in url:
+            return url
+        return url + ("&" if "?" in url else "?") + "name=orig"
+    return best_variants.get(_twimg_media_id(url), url)
+
+
 def classify_media(url: str, ctype: str):
     u = url.lower()
     if "video" in ctype or ".mp4" in u or "video.twimg" in u:
@@ -949,6 +996,14 @@ def process_add_x(task_id: str, url: str, topic_id: str, detected: dict):
         warnings = []
         remote = []
         media_path = media_name = image_path = ""
+        # opencli 给的视频直链是最低码率变体，图片是长边 1200 封顶的 medium 档，先各自抬到原始清晰度
+        best_variants = {}
+        if any(_twimg_media_id(u) for u in media_urls):
+            try:
+                best_variants = fetch_twitter_best_variants(tid)
+            except Exception as e:  # noqa: BLE001
+                warnings.append(f"未取到高清变体列表，视频按 opencli 给的清晰度下载：{e}")
+        media_urls = [upgrade_x_media_url(u, best_variants) for u in media_urls]
         for i, u in enumerate(media_urls, start=1):
             try:
                 m = download_media(u, tid, i)
@@ -1104,14 +1159,28 @@ def extract_frames(media_rel: str, warnings: list) -> dict:
     return out
 
 
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _first_existing_media(files: list) -> tuple:
+    """从一次下载落盘的文件里挑出挂到卡片上的视频和图片。
+
+    视频取体积最大的那个：小红书一条笔记会同时落下原片和多档转码，按修改时间取第一个
+    命中的是最后落盘的那条，不保证是最清晰的。图片仍按传入顺序取第一张（封面语义）。
+    """
     media_path = media_name = image_path = ""
+    videos = [p for p in files if classify_local_file(p) == "video"]
+    if videos:
+        best = max(videos, key=_file_size)
+        media_path, media_name = relpath(best), os.path.basename(best)
     for path in files:
-        kind = classify_local_file(path)
-        if kind == "video" and not media_path:
-            media_path, media_name = relpath(path), os.path.basename(path)
-        elif kind == "image" and not image_path:
+        if classify_local_file(path) == "image":
             image_path = relpath(path)
+            break
     return media_path, media_name, image_path
 
 
@@ -1450,6 +1519,19 @@ DOUYIN_MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
                     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
 
 
+def _douyin_hd_play_url(url: str) -> str:
+    """把播放地址的清晰度参数抬到 1080p。
+
+    免登录拿到的播放地址固定带 ratio=720p，而原片常在 1080p 以上（实测一条 2560x1440 的
+    原片按 720p 下成了 1280x720）。实测 ratio=1080p 返回 1920x1080，ratio=2k 回落到
+    1920x1080，ratio=4k 反而返回 854x480，因此上限取 1080p。
+    只改本来就带 ratio 的地址，避免给带签名的 CDN 直链追加参数导致签名失效。
+    """
+    if not url or "ratio=" not in url:
+        return url
+    return re.sub(r"ratio=[^&]*", "ratio=1080p", url)
+
+
 def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
     """策略 A：链接里带 sec_uid（用户页 modal 链接）时，从作品列表精确匹配。"""
     p = run_opencli_site("douyin", ["user-videos", sec_uid, "--limit", "20",
@@ -1466,7 +1548,7 @@ def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
                 "desc": str(r.get("title") or ""),
                 "author": str(r.get("author") or r.get("nickname") or ""),
                 "secUid": sec_uid,
-                "playUrl": str(r.get("play_url") or ""),
+                "playUrl": _douyin_hd_play_url(str(r.get("play_url") or "")),
                 "cover": "",
                 "createTime": "",
                 "comments": r.get("top_comments") if isinstance(r.get("top_comments"), list) else [],
@@ -1512,9 +1594,11 @@ def _douyin_meta_from_share_page(aweme_id: str):
     uri = str(play_addr.get("uri") or "")
     play = str(url_list[0]) if url_list else ""
     if not play and uri:
-        play = f"https://www.iesdouyin.com/aweme/v1/play/?video_id={uri}&ratio=720p&line=0"
+        play = f"https://www.iesdouyin.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
     # 分享页地址常带水印标记，尝试换成无水印端点
     play = play.replace("playwm", "play")
+    # 分享页给的地址固定是 720p，抬到 1080p
+    play = _douyin_hd_play_url(play)
     cover_addr = video.get("cover") if isinstance(video.get("cover"), dict) else {}
     cover_list = cover_addr.get("url_list") if isinstance(cover_addr.get("url_list"), list) else []
     create_time = item.get("create_time")
