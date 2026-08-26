@@ -15,14 +15,26 @@ repair_published_time.py —— 存量数据一次性修复：按本机时区渲
               rawMeta.publish_time == published  ->  opencli 兜底给的 UTC 串，+8 小时
               否则                                ->  当初是 localtime 渲染的，按本机时区反解再转北京
   douyin    库里没留 create_time，只能把串按本机时区反解回时间戳再转北京。
-            额外拿 aweme_id 高 32 位（ID 生成时刻）做旁证打印出来——它比发布时刻略早
-            属正常，不作为真值。
+            会顺带打印 aweme_id 高 32 位反推出来的时刻，但**那个值不可信，不参与判定**：
+            实测两条样本方向相反——7587225361230974260 反推值比真值早 51 分钟，而
+            7677604913714923194 反推值比页面显示的发布时间晚 731 分钟。`>> 32` 这个位移
+            约定也查不到官方依据。打印它只是留个人工核对的锚点，别拿它当真值填库。
   x         不动。format_published 存的是 "... UTC；北京时间 ..."，时区本来就是显式的。
   xiaohongshu 从笔记 id 反推，本来就按北京时间渲染（见 xhs_published_from_note_id），
             只在跟重算结果不一致时才改。
 
 published 为空的一律跳过：那是当初就没抓到时间，属于"缺数据"，不是"时区错"，
 补它需要重新抓一次原帖，不在本脚本职责内。
+
+⚠️ 幂等性：凡是"拿库里的串反过来推"的路径都**不幂等**——修完之后那个串已经是北京时间，
+再推一次就再加一次时差。踩过两次：一条抖音被从 10:00:24 又推到次日 02:00:24；B 站接口
+偶发取不到时退回本地推算，也会把 17:32:43 推成次日 09:32:43。
+
+只有"从外部真值重算"的路径是幂等的：bilibili 走公开接口 pubdate、xiaohongshu 从笔记 id 反推。
+
+所以脚本用"备份文件是否已存在"判断这次迁移跑过没有。跑过就拒绝再跑；硬要跑得加 --again，
+而 --again 下会关掉所有不幂等的路径：跳过 douyin，bilibili 接口取不到时也直接跳过、
+不再退回本地推算。
 
 用法：
   python3 server/repair_published_time.py --dry-run   # 只列出会改哪些，不写盘
@@ -66,7 +78,7 @@ def local_text_to_ts(text: str):
     return None
 
 
-def fixed_bilibili(post: dict, note: list) -> str:
+def fixed_bilibili(post: dict, note: list, repeat: bool = False) -> str:
     bvid = str(post.get("externalId") or "")
     stored = str(post.get("published") or "")
     meta = S.fetch_bilibili_view(bvid) if bvid else {}
@@ -74,6 +86,10 @@ def fixed_bilibili(post: dict, note: list) -> str:
     if truth:
         note.append("公开接口 pubdate")
         return truth
+    if repeat:
+        # 重跑时只认外部真值。下面两条都是"拿库里的串反推"，对已修过的数据会再加一次时差。
+        note.append("公开接口没取到，重跑时不做本地推算，跳过")
+        return stored
     raw = post.get("rawMeta") or {}
     if str(raw.get("publish_time") or "") == stored:
         note.append("opencli 兜底 UTC 串 +8")
@@ -83,7 +99,7 @@ def fixed_bilibili(post: dict, note: list) -> str:
     return S.published_beijing(ts) if ts else stored
 
 
-def fixed_douyin(post: dict, note: list) -> str:
+def fixed_douyin(post: dict, note: list, repeat: bool = False) -> str:
     stored = str(post.get("published") or "")
     ts = local_text_to_ts(stored)
     if not ts:
@@ -92,8 +108,9 @@ def fixed_douyin(post: dict, note: list) -> str:
     try:
         id_ts = int(str(post.get("externalId") or "0")) >> 32
         if 1_000_000_000 <= id_ts <= 4_000_000_000:
-            gap = (ts - id_ts) / 60.0
-            note.append(f"按本机时区反解；旁证 aweme_id 时刻早 {gap:.0f} 分钟")
+            gap = (id_ts - ts) / 60.0
+            note.append(f"按本机时区反解；aweme_id 反推值{'晚' if gap > 0 else '早'}"
+                        f" {abs(gap):.0f} 分钟（该反推法实测不可靠，仅供人工核对）")
         else:
             note.append("按本机时区反解")
     except ValueError:
@@ -101,7 +118,7 @@ def fixed_douyin(post: dict, note: list) -> str:
     return S.published_beijing(ts)
 
 
-def fixed_xiaohongshu(post: dict, note: list) -> str:
+def fixed_xiaohongshu(post: dict, note: list, repeat: bool = False) -> str:
     note.append("按笔记 id 重算")
     return S.xhs_published_from_note_id(str(post.get("externalId") or "")) or str(post.get("published") or "")
 
@@ -119,7 +136,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="把按本机时区渲染的 published 修成北京时间")
     ap.add_argument("--dry-run", action="store_true", help="只列出会改哪些，不写盘")
     ap.add_argument("--force", action="store_true", help="后端在运行时也强制写回（不建议）")
+    ap.add_argument("--again", action="store_true",
+                    help="本次迁移已经跑过时仍然执行；会跳过不幂等的 douyin")
     args = ap.parse_args()
+
+    already_ran = os.path.exists(BACKUP_FILE)
+    if already_ran and not args.again:
+        print(f"备份文件已存在，说明这次迁移跑过了：{BACKUP_FILE}")
+        print("douyin 那条路不幂等，再跑一次会把已经是北京时间的值又加一次时差。")
+        print("确实要再跑（只刷新 bilibili / xiaohongshu）就加 --again。")
+        return 2
+    skip_douyin = already_ran and args.again
+    if skip_douyin:
+        print("--again：跳过 douyin（不幂等），只重算 bilibili / xiaohongshu。")
 
     print(f"内容层：{S.VAULT_ROOT}")
     print(f"数据文件：{S.POSTS_FILE}")
@@ -135,6 +164,8 @@ def main() -> int:
     changes, skipped_empty, checked = [], 0, 0
     for p in posts:
         plat = str(p.get("platform") or "")
+        if plat == "douyin" and skip_douyin:
+            continue
         fixer = FIXERS.get(plat)
         if not fixer:
             continue
@@ -144,7 +175,7 @@ def main() -> int:
             continue
         checked += 1
         note = []
-        new = fixer(p, note)
+        new = fixer(p, note, skip_douyin)
         if new and new != stored:
             changes.append((p, stored, new, "；".join(note)))
         if plat == "bilibili":
