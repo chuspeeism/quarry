@@ -779,21 +779,8 @@ def check_opencli_profile():
               f"不指定的话 opencli 会拒绝执行，本次显式用：{OPENCLI_PROFILE}")
 
 
-def run_opencli_site(site: str, args, timeout=120):
-    """所有 opencli 调用的唯一出口。
-
-    窗口/profile/会话这三个"别来打扰我"的开关在这里统一注入，调用方不用各自记得写，
-    也就不会再出现某条命令漏了 --window background 就把浏览器怼到最前面的情况。
-    """
-    args = list(args)
-    cmd = [OPENCLI]
-    if OPENCLI_PROFILE:
-        cmd += ["--profile", OPENCLI_PROFILE]
-    cmd += [site] + args
-    if OPENCLI_WINDOW and "--window" not in args:
-        cmd += ["--window", OPENCLI_WINDOW]
-    if OPENCLI_SITE_SESSION and "--site-session" not in args:
-        cmd += ["--site-session", OPENCLI_SITE_SESSION]
+def _spawn_opencli(cmd, site: str, timeout: int, label: str):
+    """真正去起 opencli 进程的地方：串行锁、环境变量、超时降级都在这一层。"""
     # 命令行参数之外再兜一层环境变量：opencli 内部再起子命令时也照样是背景窗口
     env = dict(os.environ)
     if OPENCLI_WINDOW:
@@ -809,8 +796,50 @@ def run_opencli_site(site: str, args, timeout=120):
             # 超时按"这条命令失败"处理，不要炸掉整次导入：浏览器桥被别的活占住时，
             # 一条字幕命令超时不该让已经抓到的正文和视频全部作废（队列跑无人值守，
             # 这点尤其要紧）。调用点本来就有 returncode != 0 的降级分支。
-            return subprocess.CompletedProcess(
-                cmd, 124, "", f"opencli {site} {args[0] if args else ''} 超时（{timeout}s），已跳过")
+            return subprocess.CompletedProcess(cmd, 124, "", f"{label} 超时（{timeout}s），已跳过")
+
+
+def run_opencli_site(site: str, args, timeout=120):
+    """所有 opencli 适配器命令的唯一出口。
+
+    窗口/profile/会话这三个"别来打扰我"的开关在这里统一注入，调用方不用各自记得写，
+    也就不会再出现某条命令漏了 --window background 就把浏览器怼到最前面的情况。
+    """
+    args = list(args)
+    cmd = [OPENCLI]
+    if OPENCLI_PROFILE:
+        cmd += ["--profile", OPENCLI_PROFILE]
+    cmd += [site] + args
+    if OPENCLI_WINDOW and "--window" not in args:
+        cmd += ["--window", OPENCLI_WINDOW]
+    if OPENCLI_SITE_SESSION and "--site-session" not in args:
+        cmd += ["--site-session", OPENCLI_SITE_SESSION]
+    return _spawn_opencli(cmd, site, timeout, f"opencli {site} {args[0] if args else ''}")
+
+
+def run_opencli_browser(session: str, args, timeout=120, site: str = "browser"):
+    """opencli browser <会话名> ... 的出口：适配器没覆盖到的站点，自己开页自己取数。
+
+    跟 run_opencli_site 的区别只有两点：命令头是 `browser <会话名>`，以及不能带
+    --site-session（通用浏览器子命令不认这个开关，命名会话本身就是它的会话机制）。
+    profile 和背景窗口这两条"别来打扰我"的约定照旧。
+    site 只用来挑串行锁：驱动哪个站点的页面，就跟那个站点的适配器命令排同一条队，
+    免得两条命令在同一个标签页里互相把页面导航掉。
+    """
+    args = list(args)
+    cmd = [OPENCLI]
+    if OPENCLI_PROFILE:
+        cmd += ["--profile", OPENCLI_PROFILE]
+    cmd += ["browser", session] + args
+    if OPENCLI_WINDOW and "--window" not in args:
+        cmd += ["--window", OPENCLI_WINDOW]
+    return _spawn_opencli(cmd, site, timeout, f"opencli browser {session} {args[0] if args else ''}")
+
+
+def opencli_err(p) -> str:
+    """把 opencli 的失败原因压成一行短信息，塞进卡片 warnings 用。"""
+    msg = (p.stderr or p.stdout or "").strip().replace("\n", " ")
+    return msg[:160] or f"exit {p.returncode}"
 
 
 def run_opencli(args, timeout=120):
@@ -1631,88 +1660,143 @@ def _douyin_hd_play_url(url: str) -> str:
     return re.sub(r"ratio=[^&]*", "ratio=1080p", url)
 
 
-def _douyin_meta_from_user_videos(sec_uid: str, aweme_id: str):
-    """策略 A：链接里带 sec_uid（用户页 modal 链接）时，从作品列表精确匹配。"""
-    p = run_opencli_site("douyin", ["user-videos", sec_uid, "--limit", "20",
-                                   "--with_comments", "true", "--comment_limit", "5",
-                                   "-f", "json"], timeout=240)
-    if p.returncode != 0:
-        raise RuntimeError(f"opencli douyin user-videos 失败：{(p.stderr or '')[:120]}")
-    rows = json.loads(p.stdout)
-    if not isinstance(rows, list):
-        return None
-    for r in rows:
-        if isinstance(r, dict) and str(r.get("aweme_id")) == str(aweme_id):
-            return {
-                "desc": str(r.get("title") or ""),
-                "author": str(r.get("author") or r.get("nickname") or ""),
-                "secUid": sec_uid,
-                "playUrl": _douyin_hd_play_url(str(r.get("play_url") or "")),
-                "cover": "",
-                "createTime": "",
-                "comments": r.get("top_comments") if isinstance(r.get("top_comments"), list) else [],
-                "stats": build_stats("douyin", r),
-            }
-    return None
+# 抖音采集用的浏览器会话名：所有抖音取数命令共用一个标签页，采一条就在这页上导航一次，
+# 不会每条链接弹一个新页（跟 opencli 适配器的 --site-session persistent 是同一个用意）。
+DOUYIN_BROWSER_SESSION = "quarry-douyin"
 
-
-def _douyin_find_item(obj):
-    """在 _ROUTER_DATA 里递归找 item_list[0]。"""
-    if isinstance(obj, dict):
-        item_list = obj.get("item_list")
-        if isinstance(item_list, list) and item_list and isinstance(item_list[0], dict):
-            return item_list[0]
-        for v in obj.values():
-            r = _douyin_find_item(v)
-            if r:
-                return r
-    elif isinstance(obj, list):
-        for v in obj:
-            r = _douyin_find_item(v)
-            if r:
-                return r
-    return None
-
-
-def _douyin_meta_from_share_page(aweme_id: str):
-    """策略 B：无登录态依赖的分享页 _ROUTER_DATA 解析（移动端 UA）。"""
-    share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
-    req = urllib.request.Request(share_url, headers={"User-Agent": DOUYIN_MOBILE_UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        html = resp.read().decode("utf-8", "ignore")
-    m = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", html, re.S)
-    if not m:
-        raise RuntimeError("分享页未返回 _ROUTER_DATA（可能触发风控）")
-    item = _douyin_find_item(json.loads(m.group(1)))
-    if not item:
-        raise RuntimeError("分享页数据里没有视频条目")
-    video = item.get("video") if isinstance(item.get("video"), dict) else {}
-    author = item.get("author") if isinstance(item.get("author"), dict) else {}
-    play_addr = video.get("play_addr") if isinstance(video.get("play_addr"), dict) else {}
-    url_list = play_addr.get("url_list") if isinstance(play_addr.get("url_list"), list) else []
-    uri = str(play_addr.get("uri") or "")
-    play = str(url_list[0]) if url_list else ""
-    if not play and uri:
-        play = f"https://www.iesdouyin.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0"
-    # 分享页地址常带水印标记，尝试换成无水印端点
-    play = play.replace("playwm", "play")
-    # 分享页给的地址固定是 720p，抬到 1080p
-    play = _douyin_hd_play_url(play)
-    cover_addr = video.get("cover") if isinstance(video.get("cover"), dict) else {}
-    cover_list = cover_addr.get("url_list") if isinstance(cover_addr.get("url_list"), list) else []
-    create_time = item.get("create_time")
-    published = ""
-    if isinstance(create_time, (int, float)) and create_time > 0:
-        published = published_beijing(create_time)
+# 在登录态抖音页面里跑的取数脚本。占位符由 _douyin_meta_from_web_api() 替换。
+#
+# 为什么必须在页面里发而不是在 Python 里发：
+#   1) 要带登录 Cookie；
+#   2) comment/list 要签名（a_bogus），签名由抖音页面自己的 JS 挂在 window.fetch 上，
+#      在非抖音页面（哪怕同域的 robots.txt）发同样的请求会回 200 + 空 body。
+# 清晰度：只在 H.264 档位里挑像素最多的那一档。抖音更高的 1440p 档只有 H.265/bytevc1
+# 版本，换成它会牺牲兼容性，所以维持 PR #10 定下的"上限 1080p"。
+DOUYIN_META_JS = r"""
+(async () => {
+  const AWEME = "__AWEME_ID__";
+  const SEC = "__SEC_UID__";
+  const api = async (url) => {
+    const r = await fetch(url, { credentials: "include", headers: { referer: "https://www.douyin.com/" } });
+    const t = await r.text();
+    if (!t) return null;
+    try { return JSON.parse(t); } catch (e) { return null; }
+  };
+  const slim = (a) => {
+    const v = a.video || {};
+    const cands = [];
+    for (const b of (v.bit_rate || [])) {
+      if (!b || !b.play_addr || b.is_h265 === 1 || b.is_bytevc1 === 1) continue;
+      cands.push({ addr: b.play_addr, br: b.bit_rate || 0 });
+    }
+    for (const pa of [v.play_addr, v.play_addr_h264]) if (pa) cands.push({ addr: pa, br: 0 });
+    cands.sort((x, y) =>
+      ((y.addr.width || 0) * (y.addr.height || 0) - (x.addr.width || 0) * (x.addr.height || 0)) || (y.br - x.br));
+    const best = (cands[0] || {}).addr || {};
+    const cov = v.cover_original_scale || v.origin_cover || v.cover || {};
     return {
-        "desc": str(item.get("desc") or ""),
-        "author": str(author.get("nickname") or ""),
-        "secUid": str(author.get("sec_uid") or ""),
-        "playUrl": play,
-        "cover": str(cover_list[0]) if cover_list else "",
-        "createTime": published,
-        "comments": [],
-        "stats": build_stats("douyin", item),
+      desc: a.desc || "",
+      author: (a.author || {}).nickname || "",
+      sec_uid: (a.author || {}).sec_uid || "",
+      create_time: a.create_time || 0,
+      // 同一档清晰度抖音会给两三条不同 CDN 的镜像地址，全带回去，下载时逐条退
+      play_urls: (best.url_list || []).slice(0, 4),
+      width: best.width || 0,
+      height: best.height || 0,
+      cover_urls: (cov.url_list || []).slice(0, 3),
+      statistics: a.statistics || {},
+    };
+  };
+  // 视频页会自动播放，取数期间先摁停，别让后台标签页白下几十兆
+  for (const el of document.querySelectorAll("video")) { try { el.pause(); } catch (e) {} }
+  const out = { aweme: null, comments: [], notes: [] };
+  const d = await api("https://www.douyin.com/aweme/v1/web/aweme/detail/?aweme_id=" + AWEME + "&aid=6383");
+  if (d && d.aweme_detail && d.aweme_detail.aweme_id) out.aweme = slim(d.aweme_detail);
+  else out.notes.push("detail 接口没返回视频条目");
+  if (!out.aweme && SEC) {
+    const q = await api("https://www.douyin.com/aweme/v1/web/aweme/post/?sec_user_id=" + SEC + "&max_cursor=0&count=20&aid=6383");
+    const hit = ((q && q.aweme_list) || []).find((x) => String(x.aweme_id) === AWEME);
+    if (hit) out.aweme = slim(hit);
+    else out.notes.push("作者近 20 条作品里也没有这条");
+  }
+  const c = await api("https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=" + AWEME + "&count=5&cursor=0&aid=6383");
+  out.comments = ((c && c.comments) || []).slice(0, 5).map((x) => ({
+    text: x.text || "", digg_count: x.digg_count || 0, nickname: (x.user || {}).nickname || "",
+  }));
+  if (!out.comments.length) out.notes.push("没取到热评");
+  return JSON.stringify(out);
+})()
+"""
+
+
+def _fetch_first_ok(urls, headers, timeout=120, min_bytes=0):
+    """挨个试镜像地址，返回 (内容, 失败原因列表)；全挂了内容是空 bytes。
+
+    抖音的播放地址和封面地址都是一组不同 CDN 的镜像。只认第一条的话，某条 CDN 偶发
+    TLS 中断（本机 VPN 的 fake-IP 劫持就会造成 SSL: UNEXPECTED_EOF）就会让整条采集
+    丢掉视频本体，连带 ASR 口播和关键帧一起没有——所以逐条退。
+    """
+    errors = []
+    for url in urls:
+        if not url:
+            continue
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                blob = resp.read()
+            if not blob or len(blob) < min_bytes:
+                raise RuntimeError(f"下载内容异常（{len(blob)} bytes）")
+            return blob, errors
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{urlparse(url).netloc or url[:40]}: {e}")
+    return b"", errors
+
+
+def _douyin_meta_from_web_api(aweme_id: str, sec_uid: str = ""):
+    """抓元数据：在登录态的抖音视频页里调网页接口。
+
+    老的分享页路子（iesdouyin.com/share/video/<id> 里的 _ROUTER_DATA.item_list）2026-08
+    起彻底失效：抖音把视频条目从分享页 SSR 里拿掉了，只剩 ua / abParams / 唤端配置，
+    换域名换 UA 都一样，所以那条路已经删掉，不再留着白报一次错。
+    改成开一次视频页、在页面里发三个网页接口：
+      detail  拿元数据（正文/作者/发布时间/各清晰度播放地址/互动数）
+      post    detail 被风控时的兜底，链接里带 sec_uid 才有得退（作者作品列表里精确匹配）
+      comment 拿热评，喂卡片的「补充说明」
+    这条路同时补齐了老 `opencli douyin user-videos` 缺的 create_time 和 author
+    ——那条适配器命令只透出 aweme_id/title/duration/digg_count/play_url/top_comments，
+    落库的卡片上「发布时间」「作者」都是空的。
+    """
+    page_url = f"https://www.douyin.com/video/{aweme_id}"
+    p = run_opencli_browser(DOUYIN_BROWSER_SESSION, ["open", page_url], timeout=120, site="douyin")
+    if p.returncode != 0:
+        raise RuntimeError(f"打开视频页失败：{opencli_err(p)}")
+    js = DOUYIN_META_JS.replace("__AWEME_ID__", aweme_id).replace("__SEC_UID__", sec_uid or "")
+    p = run_opencli_browser(DOUYIN_BROWSER_SESSION, ["eval", js], timeout=120, site="douyin")
+    if p.returncode != 0:
+        raise RuntimeError(f"页面取数失败：{opencli_err(p)}")
+    try:
+        data = json.loads((p.stdout or "").strip())
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"页面取数返回的不是 JSON：{(p.stdout or '').strip()[:120]}")
+    aweme = data.get("aweme")
+    notes = [str(n) for n in (data.get("notes") or [])]
+    if not isinstance(aweme, dict):
+        raise RuntimeError("；".join(notes) or "接口没返回视频条目")
+    comments = [c for c in (data.get("comments") or []) if isinstance(c, dict)]
+    return {
+        "desc": str(aweme.get("desc") or ""),
+        "author": str(aweme.get("author") or ""),
+        "secUid": str(aweme.get("sec_uid") or ""),
+        # 播放地址已经是挑出来的最高 H.264 档，_douyin_hd_play_url 只对老式带 ratio= 的
+        # 地址起作用，这里再过一道是为了兜住接口哪天换回那种形态
+        "playUrls": [_douyin_hd_play_url(str(u)) for u in (aweme.get("play_urls") or []) if u],
+        "coverUrls": [str(u) for u in (aweme.get("cover_urls") or []) if u],
+        # 抖音页面上那行时间是按浏览器本机时区渲染的（本机在美西就显示美西时间），
+        # 卡片一律按北京时间存，跟 B 站/小红书对齐
+        "createTime": published_beijing(aweme.get("create_time")),
+        "comments": comments,
+        "stats": build_stats("douyin", aweme),
+        "notes": notes,
     }
 
 
@@ -1758,22 +1842,16 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         _douyin_placeholder(task_id, url, topic_id, detected, warnings)
         return
 
-    # 抓元数据：A) 用户页作品列表精确匹配  B) 分享页 _ROUTER_DATA
+    # 抓元数据：开一次登录态视频页，在页面里调抖音的网页接口（detail / post / comment）
     set_task(task_id, stage="fetching", topic=topic_id, message="正在抓取抖音视频信息")
     meta = None
     sec_match = re.search(r"/user/([\w-]+)", canonical)
-    if sec_match:
-        try:
-            meta = _douyin_meta_from_user_videos(sec_match.group(1), aweme_id)
-            if meta is None:
-                warnings.append("作者近 20 条作品里未找到该视频，改用分享页解析")
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"作品列表抓取失败：{e}")
-    if meta is None:
-        try:
-            meta = _douyin_meta_from_share_page(aweme_id)
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"分享页解析失败：{e}")
+    try:
+        meta = _douyin_meta_from_web_api(aweme_id, sec_match.group(1) if sec_match else "")
+        # 热评没取到之类的小缺口不该拦住入库，但要在卡片上留个痕
+        warnings.extend(meta.get("notes") or [])
+    except Exception as e:  # noqa: BLE001
+        warnings.append(f"抖音网页接口抓取失败：{e}")
     if meta is None:
         _douyin_placeholder(task_id, url, topic_id, detected, warnings)
         return
@@ -1784,32 +1862,26 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
     os.makedirs(video_dir, exist_ok=True)
     media_path = media_name = image_path = ""
     dl_headers = {"User-Agent": DOUYIN_MOBILE_UA, "Referer": "https://www.douyin.com/"}
-    if meta["playUrl"]:
-        try:
-            req = urllib.request.Request(meta["playUrl"], headers=dl_headers)
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                blob = resp.read()
-            if not blob or len(blob) < 20 * 1024:
-                raise RuntimeError(f"下载内容异常（{len(blob)} bytes）")
+    if meta["playUrls"]:
+        blob, errs = _fetch_first_ok(meta["playUrls"], dl_headers, timeout=180, min_bytes=20 * 1024)
+        if blob:
             video_abs = os.path.join(video_dir, f"{aweme_id}.mp4")
             with open(video_abs, "wb") as f:
                 f.write(blob)
             media_path, media_name = relpath(video_abs), f"{aweme_id}.mp4"
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"视频下载失败：{e}")
+        else:
+            warnings.append(f"视频下载失败：{'；'.join(errs)[:300]}")
     else:
         warnings.append("未拿到视频播放地址")
-    if meta["cover"]:
-        try:
-            req = urllib.request.Request(meta["cover"], headers=dl_headers)
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                blob = resp.read()
+    if meta["coverUrls"]:
+        blob, errs = _fetch_first_ok(meta["coverUrls"], dl_headers, timeout=60)
+        if blob:
             cover_abs = os.path.join(video_dir, f"{aweme_id}_cover.jpg")
             with open(cover_abs, "wb") as f:
                 f.write(blob)
             image_path = relpath(cover_abs)
-        except Exception as e:  # noqa: BLE001
-            warnings.append(f"封面下载失败：{e}")
+        else:
+            warnings.append(f"封面下载失败：{'；'.join(errs)[:200]}")
 
     # 口播转写（四件套）
     title = meta["desc"].strip().splitlines()[0][:40] if meta["desc"].strip() else f"抖音视频 {aweme_id}"
@@ -1844,7 +1916,7 @@ def process_add_douyin(task_id: str, url: str, topic_id: str, detected: dict):
         "body": "🤖 正在生成中文内容卡片…", "summary": "", "originalText": material or meta["desc"],
         "originalIsExcerpt": False, "originalNote": "", "keywords": [], "supplement": supplement,
         "sourceLink": canonical, "mediaPath": media_path, "mediaName": media_name,
-        "imagePath": image_path, "remoteMedia": ([meta["playUrl"]] if (meta["playUrl"] and not media_path) else []),
+        "imagePath": image_path, "remoteMedia": (meta["playUrls"][:1] if not media_path else []),
         "articleLinks": [], "transcript": tr["transcript"],
         "transcriptSrtPath": tr["transcriptSrtPath"], "transcriptMdPath": tr["transcriptMdPath"],
         "audioPath": tr["audioPath"], "transcriptSource": tr["transcriptSource"],
