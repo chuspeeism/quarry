@@ -15,10 +15,11 @@ repair_published_time.py —— 存量数据一次性修复：按本机时区渲
               rawMeta.publish_time == published  ->  opencli 兜底给的 UTC 串，+8 小时
               否则                                ->  当初是 localtime 渲染的，按本机时区反解再转北京
   douyin    库里没留 create_time，只能把串按本机时区反解回时间戳再转北京。
-            会顺带打印 aweme_id 高 32 位反推出来的时刻，但**那个值不可信，不参与判定**：
-            实测两条样本方向相反——7587225361230974260 反推值比真值早 51 分钟，而
-            7677604913714923194 反推值比页面显示的发布时间晚 731 分钟。`>> 32` 这个位移
-            约定也查不到官方依据。打印它只是留个人工核对的锚点，别拿它当真值填库。
+            会顺带打印 aweme_id 高 32 位反推出来的时刻，**仅供人工核对，不参与判定**：
+            两条样本方向一致（ID 生成时刻都早于发布时刻），但偏差量差很多——
+            7587225361230974260 早 51 分钟，7677604913714923194 早 169 分钟（均以
+            yt-dlp 拉到的 epoch 为真值）。方向能当粗略锚点，具体值不能当真值填库。
+            `>> 32` 这个位移约定也查不到官方依据。
   x         不动。format_published 存的是 "... UTC；北京时间 ..."，时区本来就是显式的。
   xiaohongshu 从笔记 id 反推，本来就按北京时间渲染（见 xhs_published_from_note_id），
             只在跟重算结果不一致时才改。
@@ -110,7 +111,7 @@ def fixed_douyin(post: dict, note: list, repeat: bool = False) -> str:
         if 1_000_000_000 <= id_ts <= 4_000_000_000:
             gap = (id_ts - ts) / 60.0
             note.append(f"按本机时区反解；aweme_id 反推值{'晚' if gap > 0 else '早'}"
-                        f" {abs(gap):.0f} 分钟（该反推法实测不可靠，仅供人工核对）")
+                        f" {abs(gap):.0f} 分钟（仅供人工核对，不参与判定）")
         else:
             note.append("按本机时区反解")
     except ValueError:
