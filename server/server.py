@@ -49,7 +49,7 @@ import threading
 import time
 import urllib.request
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse, unquote
@@ -682,8 +682,7 @@ def xhs_published_from_note_id(note_id: str) -> str:
     前 8 位十六进制就是 id 生成时刻的 Unix 时间戳，约等于发布时刻（opencli 自己
     的 search 也是这么给 published_at 的）。拿不准的 id 一律返回空。
 
-    统一按北京时间渲染：小红书页面上显示的就是北京时间，跑服务的机器时区不一定
-    是 +8，跟着本机时区走卡片会跟原帖对不上（机器在美西就差了 15 小时）。
+    渲染统一交给 published_beijing()，跟 B 站/抖音走同一套北京时间。
     """
     nid = (note_id or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{24}", nid):
@@ -691,7 +690,7 @@ def xhs_published_from_note_id(note_id: str) -> str:
     ts = int(nid[:8], 16)
     if not 1_000_000_000 <= ts <= 4_000_000_000:
         return ""
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts + 8 * 3600))
+    return published_beijing(ts)
 
 
 def extract_douyin_id(url: str) -> str:
@@ -896,6 +895,42 @@ def upgrade_x_media_url(url: str, best_variants: dict) -> str:
             return url
         return url + ("&" if "?" in url else "?") + "name=orig"
     return best_variants.get(_twimg_media_id(url), url)
+
+
+def published_beijing(ts) -> str:
+    """Unix 时间戳 -> 北京时间 "YYYY-MM-DD HH:MM:SS"，认不出的返回空串。
+
+    B 站/抖音/小红书页面上显示的都是北京时间，而跑服务的机器时区不一定是 +8，用
+    time.localtime 渲染卡片就跟原帖对不上（机器在美西差 15 小时）。所以一律按 +8
+    渲染，不跟本机时区走。
+    """
+    try:
+        n = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(n + 8 * 3600))
+
+
+def utc_text_to_beijing(value) -> str:
+    """把不带时区标记的 UTC 时间串挪成北京时间，认不出的格式原样返回。
+
+    opencli 的 bilibili video 给的 publish_time 是
+    `new Date(pubdate * 1000).toISOString()` 切出来的 "YYYY-MM-DD HH:MM"，是 UTC 且
+    不带标记；B 站页面显示的是北京时间，直接存卡片就差 8 小时。只有公开接口
+    （fetch_bilibili_view）挂了退回 opencli 时才会走到这条路。
+    """
+    s = str(value or "").strip()
+    m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(:\d{2})?", s)
+    if not m:
+        return s
+    fmt = "%Y-%m-%d %H:%M:%S" if m.group(3) else "%Y-%m-%d %H:%M"
+    try:
+        dt = datetime.strptime(f"{m.group(1)} {m.group(2)}{m.group(3) or ''}", fmt)
+    except ValueError:
+        return s
+    return (dt + timedelta(hours=8)).strftime(fmt)
 
 
 def classify_media(url: str, ctype: str):
@@ -1293,7 +1328,7 @@ def fetch_bilibili_view(bvid: str) -> dict:
     meta = dict(data)
     pubdate = data.get("pubdate")
     if isinstance(pubdate, (int, float)) and pubdate > 0:
-        meta["published"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(pubdate)))
+        meta["published"] = published_beijing(pubdate)
     return meta
 
 
@@ -1465,7 +1500,9 @@ def process_add_bilibili(task_id: str, url: str, topic_id: str, detected: dict):
         "uid": uid, "id": uid, "topic": topic_id, "platform": "bilibili", "externalId": bvid,
         "contentType": "video", "file": detected.get("canonicalUrl") or url, "title": title,
         "number": next_number(topic_id), "tweetId": "", "author": author, "handle": author,
-        "published": str(meta.get("publish_time") or meta.get("published") or meta.get("发布时间") or ""),
+        # publish_time 只在公开接口挂了、退回 opencli 时才有，是 UTC 串，得挪成北京时间
+        "published": str(utc_text_to_beijing(meta.get("publish_time"))
+                         or meta.get("published") or meta.get("发布时间") or ""),
         "body": "🤖 正在生成中文内容卡片…", "summary": "", "originalText": material,
         "originalIsExcerpt": False, "originalNote": "", "keywords": [], "supplement": "",
         "sourceLink": detected.get("canonicalUrl") or url, "mediaPath": media_path, "mediaName": media_name,
@@ -1658,7 +1695,7 @@ def _douyin_meta_from_share_page(aweme_id: str):
     create_time = item.get("create_time")
     published = ""
     if isinstance(create_time, (int, float)) and create_time > 0:
-        published = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(create_time)))
+        published = published_beijing(create_time)
     return {
         "desc": str(item.get("desc") or ""),
         "author": str(author.get("nickname") or ""),
