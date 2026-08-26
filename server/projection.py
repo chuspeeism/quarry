@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import re
 import time
 
@@ -544,6 +545,13 @@ def sync(vault_root: str, posts: list, topics: list, force: bool = False) -> dic
             "updatedAt": int(topic.get("updatedAt") or 0),
         })
 
+    # 课题被删掉之后，它在 topics/ 下的目录不会有任何东西来触发清理：帖子 md 会被上面的
+    # manifest 差分删掉，但 _topic.md 不在 manifest 里，_prune 又特意跳过它，于是目录里
+    # 永远剩着一个 _topic.md、永远不为空、永远删不掉。结果是 agent 层留着一份写着
+    # "验收测试 … 共 7 条" 的说明，而那个课题已经不存在了——AI 去 grep 就读到假数据。
+    # 这里按"活着的课题 id"兜底清理，不依赖 force：删课题是常规操作，不该等到全量重建。
+    stats["deleted"] += _prune_dead_topic_dirs(root, {t.get("id") for t in topics})
+
     _atomic_write(topics_path(vault_root), json.dumps(topic_rows, ensure_ascii=False, indent=2) + "\n")
     _atomic_write(index_path(vault_root),
                   "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in index_rows))
@@ -552,6 +560,29 @@ def sync(vault_root: str, posts: list, topics: list, force: bool = False) -> dic
                   json.dumps({"renderVersion": RENDER_VERSION, "updatedAt": int(time.time()),
                               "entries": new_manifest}, ensure_ascii=False, indent=2))
     return stats
+
+
+def _prune_dead_topic_dirs(root: str, live_ids: set) -> int:
+    """删掉 topics/ 下那些课题已经不存在了的整目录，返回删掉的文件数。
+
+    只认"目录名不在活着的课题 id 里"这一条，不看目录内容——课题没了，它底下的
+    _topic.md 和残留帖子 md 就都是过期数据，整个端掉。活着的课题一律不碰，
+    哪怕它一条帖子都没有（比如新建还没收藏的课题，_topic.md 该留着）。
+    """
+    removed = 0
+    base = os.path.join(root, TOPICS_DIRNAME)
+    if not os.path.isdir(base):
+        return 0
+    for topic_dir in os.listdir(base):
+        full_dir = os.path.join(base, topic_dir)
+        if not os.path.isdir(full_dir) or topic_dir in live_ids:
+            continue
+        try:
+            removed += sum(len(files) for _, _, files in os.walk(full_dir))
+            shutil.rmtree(full_dir)
+        except OSError:
+            pass
+    return removed
 
 
 def _prune(root: str, keep: set) -> int:
