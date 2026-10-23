@@ -1,0 +1,17 @@
+{
+  "name": "quarry-e2e",
+  "private": true,
+  "description": "E2E dev tooling for Quarry (UI test harness only; the product stays zero-build Python + React-in-browser)",
+  "scripts": {
+    "test": "e2e run"
+  },
+  "devDependencies": {
+    "@e2e-dev/web": "^0.15.2",
+    "e2e": "^0.21.2"
+  },
+  "dependencies": {
+    "@babel/standalone": "7.29.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}

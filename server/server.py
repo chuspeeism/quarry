@@ -38,6 +38,7 @@ Topic Post Vault / 课题帖子库 —— 本地 X/Twitter 课题收藏器后端
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -172,11 +173,29 @@ def now_ts() -> int:
 
 
 def slugify_topic(value: str) -> str:
-    raw = (value or "").strip().lower()
+    """课题名 -> 课题 id。
+
+    纯 ASCII 名称：小写、空白折叠成 -、剔除非 [a-z0-9._-] 字符——与旧版行为一致。
+
+    含非 ASCII（中文等）的名称：旧版把它们在 ASCII 槽位里全部塌缩，任何中文名都
+    得到同一个词（纯中文名甚至是空串），第二个中文课题必撞「课题 ID 已存在」。
+    所以这类名称追加一段「原名的确定性短哈希」（sha256 前 8 位 hex）：不同名必
+    不同 id；同名同 id，重复创建仍由 topic_exists 拒绝——真正的重名照样报
+    「课题 ID 已存在」。落库的 id 是纯 ASCII 且不含空格，满足 valid_topic_id，
+    normalize_topic 重载重跑一遍结果不变（幂等），存量数据不受影响。
+    """
+    name = (value or "").strip()
+    raw = name.lower()
     raw = re.sub(r"\s+", "-", raw)
     raw = re.sub(r"[^a-z0-9._-]+", "-", raw)
     raw = re.sub(r"-{2,}", "-", raw).strip("-._")
-    return raw[:50]
+    if name.isascii():
+        return raw[:50]
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
+    if not raw:
+        return f"t-{digest}"
+    # 预留 "-xxxxxxxx" 的位置再截断，保证长名截断后哈希后缀仍在，异名仍异 id
+    return f"{raw[:41].rstrip('-._')}-{digest}"
 
 
 def valid_topic_id(topic_id: str) -> bool:
@@ -2611,6 +2630,14 @@ def lan_ip() -> str:
         s.close()
 
 
+class QuarryServer(ThreadingHTTPServer):
+    # 服务是 HTTP/1.0、无 keep-alive：浏览器首屏会为 index.html + css + 一排 js/jsx
+    # 同时建多条连接。socketserver 默认 listen backlog 只有 5，并发洪峰会把多出来的
+    # 连接直接 RST，前端表现为首屏偶发整页空白（最后一个 jsx 加载失败，Babel 不启动）。
+    # 把挂起队列调大到远超浏览器单主机并发上限（6）。
+    request_queue_size = 128
+
+
 def main():
     _ensure_dirs()
     load_posts()
@@ -2629,7 +2656,7 @@ def main():
         print(f"[app] 警告：缺少前端文件 {missing}")
     else:
         print(f"[app] 前端就位：Quarry Frost（{len(required)} 个文件 + jsx 组件）")
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = QuarryServer(("0.0.0.0", PORT), Handler)
     ip = lan_ip()
     print("=" * 56)
     print(f"  Quarry · 选题矿场 已启动")
