@@ -2611,6 +2611,14 @@ def lan_ip() -> str:
         s.close()
 
 
+class QuarryServer(ThreadingHTTPServer):
+    # 服务是 HTTP/1.0、无 keep-alive：浏览器首屏会为 index.html + css + 一排 js/jsx
+    # 同时建多条连接。socketserver 默认 listen backlog 只有 5，并发洪峰会把多出来的
+    # 连接直接 RST，前端表现为首屏偶发整页空白（最后一个 jsx 加载失败，Babel 不启动）。
+    # 把挂起队列调大到远超浏览器单主机并发上限（6）。
+    request_queue_size = 128
+
+
 def main():
     _ensure_dirs()
     load_posts()
@@ -2629,7 +2637,7 @@ def main():
         print(f"[app] 警告：缺少前端文件 {missing}")
     else:
         print(f"[app] 前端就位：Quarry Frost（{len(required)} 个文件 + jsx 组件）")
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = QuarryServer(("0.0.0.0", PORT), Handler)
     ip = lan_ip()
     print("=" * 56)
     print(f"  Quarry · 选题矿场 已启动")
